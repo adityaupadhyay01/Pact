@@ -48,6 +48,13 @@ function classify(err: unknown): AiError {
   return new AiError("upstream", "Gemini returned an error.");
 }
 
+/** Zod's JSON Schema without the `$schema` meta key, which Gemini's structured output doesn't need. */
+function jsonSchema(schema: z.ZodTypeAny) {
+  const { $schema: _meta, ...rest } = z.toJSONSchema(schema) as Record<string, unknown>;
+  void _meta;
+  return rest;
+}
+
 async function generateJson<T extends z.ZodTypeAny>(
   task: string,
   system: string,
@@ -69,7 +76,7 @@ async function generateJson<T extends z.ZodTypeAny>(
             systemInstruction: system,
             temperature: 0,
             responseMimeType: "application/json",
-            responseJsonSchema: z.toJSONSchema(schema),
+            responseJsonSchema: jsonSchema(schema),
           },
         }),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), TIMEOUT_MS)),
