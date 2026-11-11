@@ -1,67 +1,63 @@
 import { formatMoney } from "@/lib/money";
-import { getListing, type Listing } from "@/lib/marketplace";
-import { quoteTotal } from "@/lib/quote";
 import type { Requirements } from "@/lib/contract";
-import type { Evaluation } from "@/lib/rules";
-import type { ListingResult } from "@/lib/store";
+import type { ProductRecord } from "@/lib/catalog/types";
+import type { Verified } from "@/lib/store";
+import { describeRequirement } from "@/lib/rules";
 import type { SessionView } from "./api";
 
-export interface Pick {
-  listing: Listing;
-  result: ListingResult;
-  evaluation: Evaluation;
-  /** All-in price at checkout. */
-  total: number;
-}
+export type { Verified };
 
 export interface Analysis {
-  /** The product the user's shopping agent chose, and what it told the user. */
-  agent: (Pick & { claim: string; reasoning: string[] }) | null;
-  /** PACT's best verified match, when it is a different product from the agent's pick. */
-  alternative: Pick | null;
-  /** The product PACT verifies in step 3: the agent's pick, or PACT's match if the agent found nothing. */
-  subject: Pick | null;
-  listingCount: number;
+  /** What the shopping agent chose and said. */
+  agent: { record: ProductRecord; reasons: string[]; summary: string; engine: "gemini" | "test" } | null;
+  /** PACT's verification of the agent's pick. */
+  subject: Verified | null;
+  /** PACT's best verified match when the pick isn't a clean pass. */
+  alternative: Verified | null;
+  /** Every product PACT verified, pick first. */
+  checked: Verified[];
+  /** Products found but not verified (e.g. AI rate limit). */
+  unchecked: ProductRecord[];
+  candidateCount: number;
 }
 
-/** Turns the raw search result into the story the UI tells: agent picks, PACT checks, user decides. */
-export function analyse(session: SessionView): Analysis | null {
-  const s = session.search;
-  if (!s) return null;
-
-  const pick = (listingId: string, evaluation?: Evaluation): Pick | null => {
-    const listing = getListing(listingId);
-    const result = s.results.find((r) => r.listingId === listingId);
-    if (!listing || !result) return null;
-    return { listing, result, evaluation: evaluation ?? result.evaluation, total: quoteTotal(listing.checkout) };
+export function analyse(s: SessionView): Analysis {
+  const d = s.discovery;
+  const a = s.agent;
+  const v = s.verification;
+  const record = a && d ? (d.candidates.find((c) => c.id === a.chosenId) ?? null) : null;
+  const checked = v ? [v.subject, ...v.alternatives] : [];
+  const checkedIds = new Set(checked.map((x) => x.productId));
+  return {
+    agent: a && record ? { record, reasons: a.reasons, summary: a.summary, engine: a.engine } : null,
+    subject: v?.subject ?? null,
+    alternative: v?.recommendedId ? (v.alternatives.find((x) => x.productId === v.recommendedId) ?? null) : null,
+    checked,
+    unchecked: d && v ? d.candidates.filter((c) => !checkedIds.has(c.id) && v.unchecked.includes(c.id)) : [],
+    candidateCount: d?.candidates.length ?? 0,
   };
-
-  const naive = s.unprotected;
-  const agentPick = naive ? pick(naive.listingId, naive.evaluation) : null;
-  const agent = naive && agentPick ? { ...agentPick, claim: naive.claimSummary, reasoning: naive.reasoning } : null;
-  const rec = s.recommendedId ? pick(s.recommendedId) : null;
-  const subject = agent ?? rec;
-  const alternative = rec && rec.listing.id !== subject?.listing.id ? rec : null;
-  return { agent, alternative, subject, listingCount: s.results.length };
 }
 
-const fmtStorage = (gb: number) => (gb >= 1000 ? `${gb / 1000}TB` : `${gb}GB`);
-const fmtWarranty = (m: number) => (m % 12 === 0 ? `${m / 12}-year` : `${m}-month`);
+export const findVerified = (s: SessionView, id: string): Verified | null =>
+  s.verification ? ([s.verification.subject, ...s.verification.alternatives].find((x) => x.productId === id) ?? null) : null;
 
-/** The buyer's must-haves as short phrases, e.g. ["16GB+ RAM", "up to $900.00"]. */
+/** The buyer's requirements as short phrases, e.g. ["cocoa content at least 70%", "item price up to $5.00"]. */
 export function requirementTerms(r: Requirements): string[] {
   return [
-    r.condition === "new" ? "new" : "any condition",
-    r.ramGbMin !== null ? `${r.ramGbMin}GB+ RAM` : null,
-    r.storageGbMin !== null ? `${fmtStorage(r.storageGbMin)}+ storage` : null,
-    r.warrantyMonthsMin !== null ? `${fmtWarranty(r.warrantyMonthsMin)} warranty` : null,
-    `up to ${formatMoney(r.maxTotal, r.currency)} all-in`,
-  ].filter((x): x is string => Boolean(x));
+    ...r.constraints.filter((c) => c.mandatory).map((c) => `${c.label.toLowerCase()} ${describeRequirement(c)}`),
+    r.budget ? `item price up to ${formatMoney(r.budget.max, r.budget.currency)}` : "no budget yet",
+  ];
 }
 
-/** "Hidden instructions and Total price" */
 export function joinLabels(labels: string[]): string {
   const l = labels.map((x) => x.toLowerCase());
   if (l.length <= 1) return l.join("");
   return `${l.slice(0, -1).join(", ")} and ${l[l.length - 1]}`;
 }
+
+export const sourceLabel = (p: ProductRecord) =>
+  p.synthetic?.kind === "seller-mode"
+    ? "TEST: altered by Seller Mode"
+    : p.provider === "test-store"
+      ? "TEST STORE: fictional product"
+      : "Channel3 catalog";

@@ -4,13 +4,18 @@ import { quoteTotalCents, type CheckoutQuote } from "./quote";
 import type { Check, Status } from "./rules";
 import { worst } from "./rules";
 
-/** What the buyer approved: this contract, this listing, this exact checkout quote. */
+/**
+ * What the buyer approved: this contract, this product, this exact price, and
+ * the exact evidence PACT verified (by hash). Changing any of them needs a new approval.
+ */
 export interface PurchaseSnapshot {
   readonly contractHash: string;
   readonly contractVersion: number;
   readonly listingId: string;
   readonly quote: CheckoutQuote;
   readonly acknowledgedFlags: string[];
+  readonly evidenceHash?: string;
+  readonly seller?: string;
   readonly approvedAt: string;
   readonly hash: string;
 }
@@ -21,6 +26,7 @@ export function createSnapshot(
   quote: CheckoutQuote,
   acknowledgedFlags: string[],
   now: Date = new Date(),
+  binding: { evidenceHash?: string; seller?: string } = {},
 ): PurchaseSnapshot {
   const body = {
     contractHash: contract.hash,
@@ -28,6 +34,7 @@ export function createSnapshot(
     listingId,
     quote,
     acknowledgedFlags,
+    ...binding,
     approvedAt: now.toISOString(),
   };
   return deepFreeze({ ...body, hash: hashObject(body) });

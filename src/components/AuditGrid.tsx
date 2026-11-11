@@ -11,8 +11,8 @@ import {
 } from "ag-grid-community";
 import { AgGridReact } from "ag-grid-react";
 import { Download, Search } from "lucide-react";
-import { getListing } from "@/lib/marketplace";
-import type { ListingResult } from "@/lib/store";
+import type { Constraint } from "@/lib/contract";
+import type { Verified } from "@/lib/store";
 import { Button, VerdictBadge, type VerdictT } from "./ui";
 
 ModuleRegistry.registerModules([AllCommunityModule]);
@@ -36,24 +36,17 @@ const theme = themeQuartz.withParams({
   headerRowBorder: { color: "var(--color-ink)" },
 });
 
-interface Row {
+type Row = {
   id: string;
   title: string;
   seller: string;
   verdict: VerdictT;
   verdictRank: number;
-  total: number;
+  price: number;
   currency: string;
-  listed: number;
-  ram: number | null;
-  storage: number | null;
-  warranty: number | null;
-  condition: string | null;
-  issues: string;
-  blocks: number;
-  flags: number;
   injection: string;
-}
+  issues: string;
+} & Record<string, string | number>;
 
 const RANK = { PASS: 0, FLAG: 1, BLOCK: 2 } as const;
 const VERDICT_ROW_CLASS: Record<VerdictT, string> = {
@@ -62,38 +55,41 @@ const VERDICT_ROW_CLASS: Record<VerdictT, string> = {
   BLOCK: "pact-row-block",
 };
 
-const missing = (v: unknown) => (v === null || v === undefined ? "Not stated" : null);
-
-/** Every listing PACT evaluated, as a sortable, filterable, exportable audit table. */
-export function AuditGrid({ results, onSelect }: { results: ListingResult[]; onSelect: (id: string) => void }) {
+/** Every product PACT verified, as a sortable, filterable, exportable audit table. One column per requirement. */
+export function AuditGrid({
+  results,
+  constraints,
+  onSelect,
+}: {
+  results: Verified[];
+  constraints: Constraint[];
+  onSelect: (id: string) => void;
+}) {
   const grid = useRef<AgGridReact<Row>>(null);
   const [filter, setFilter] = useState("");
 
   const rows = useMemo<Row[]>(
     () =>
       results.map((r) => {
-        const l = getListing(r.listingId)!;
         const bad = r.evaluation.checks.filter((c) => c.status !== "pass");
-        return {
-          id: r.listingId,
-          title: l.title,
-          seller: l.seller,
+        const row: Row = {
+          id: r.productId,
+          title: r.record.title,
+          seller: r.record.offer.domain,
           verdict: r.evaluation.verdict,
           verdictRank: RANK[r.evaluation.verdict],
-          total: r.evaluation.totalCents / 100,
-          currency: l.checkout.currency,
-          listed: l.listedPrice,
-          ram: r.facts.ramGb?.value ?? null,
-          storage: r.facts.storageGb?.value ?? null,
-          warranty: r.facts.warrantyMonths?.value ?? null,
-          condition: r.facts.condition?.value ?? null,
-          issues: bad.map((c) => c.label).join(", ") || "—",
-          blocks: bad.filter((c) => c.status === "block").length,
-          flags: bad.filter((c) => c.status === "flag").length,
+          price: r.evaluation.totalCents / 100,
+          currency: r.record.offer.currency,
           injection: r.injection.severity === "none" ? "Clean" : `${r.injection.severity} (${r.injection.findings.length})`,
+          issues: bad.map((c) => c.label).join(", ") || "None",
         };
+        for (const c of constraints) {
+          const f = r.facts[c.id];
+          row[`c_${c.id}`] = f ? `${f.value ?? "Yes"}${f.unit ? ` ${f.unit}` : ""}` : "Not stated";
+        }
+        return row;
       }),
-    [results],
+    [results, constraints],
   );
 
   const columns = useMemo<ColDef<Row>[]>(
@@ -109,12 +105,12 @@ export function AuditGrid({ results, onSelect }: { results: ListingResult[]; onS
         cellRenderer: (p: ICellRendererParams<Row>) => (p.value ? <VerdictBadge verdict={p.value} /> : null),
         filter: "agTextColumnFilter",
       },
-      { field: "title", headerName: "Listing", minWidth: 200, flex: 2 },
+      { field: "title", headerName: "Product", minWidth: 200, flex: 2 },
       { field: "seller", headerName: "Seller", minWidth: 130, flex: 1 },
       {
-        field: "total",
-        headerName: "All-in total",
-        width: 165,
+        field: "price",
+        headerName: "Item price",
+        width: 140,
         type: "numericColumn",
         sort: "asc",
         sortIndex: 1,
@@ -122,43 +118,13 @@ export function AuditGrid({ results, onSelect }: { results: ListingResult[]; onS
           p.data ? new Intl.NumberFormat("en-US", { style: "currency", currency: p.data.currency }).format(p.value) : "",
         filter: "agNumberColumnFilter",
       },
-      {
-        field: "listed",
-        headerName: "Listed",
-        width: 95,
-        type: "numericColumn",
-        valueFormatter: (p) => (p.data ? `${p.data.currency === "USD" ? "$" : p.data.currency + " "}${p.value}` : ""),
-        filter: "agNumberColumnFilter",
-      },
-      {
-        field: "ram",
-        headerName: "RAM",
-        width: 85,
-        valueFormatter: (p) => missing(p.value) ?? `${p.value}GB`,
-        filter: "agNumberColumnFilter",
-      },
-      {
-        field: "storage",
-        headerName: "Storage",
-        width: 95,
-        valueFormatter: (p) => missing(p.value) ?? (p.value >= 1000 ? `${p.value / 1000}TB` : `${p.value}GB`),
-        filter: "agNumberColumnFilter",
-      },
-      {
-        field: "warranty",
-        headerName: "Warranty",
-        width: 105,
-        valueFormatter: (p) => missing(p.value) ?? `${p.value} mo`,
-        cellClass: (p) => (p.value === null ? "text-flag" : ""),
-        filter: "agNumberColumnFilter",
-      },
-      {
-        field: "condition",
-        headerName: "Condition",
-        width: 115,
-        valueFormatter: (p) => missing(p.value) ?? String(p.value),
-        cellClass: (p) => (p.value && p.value !== "new" ? "text-block font-medium" : ""),
-      },
+      ...constraints.map<ColDef<Row>>((c) => ({
+        field: `c_${c.id}`,
+        headerName: c.label,
+        minWidth: 110,
+        flex: 1,
+        cellClass: (p) => (p.value === "Not stated" ? "text-flag" : ""),
+      })),
       {
         field: "injection",
         headerName: "Injection",
@@ -167,7 +133,7 @@ export function AuditGrid({ results, onSelect }: { results: ListingResult[]; onS
       },
       { field: "issues", headerName: "Why", minWidth: 220, flex: 2, tooltipField: "issues" },
     ],
-    [],
+    [constraints],
   );
 
   return (
@@ -178,19 +144,16 @@ export function AuditGrid({ results, onSelect }: { results: ListingResult[]; onS
           <input
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            placeholder="Search, e.g. refurbished or warranty"
+            placeholder="Search the table"
             className="input pl-9"
             aria-label="Filter audit table"
           />
         </label>
-        <Button
-          variant="secondary"
-          onClick={() => grid.current?.api.exportDataAsCsv({ fileName: "pact-listing-audit.csv" })}
-        >
+        <Button variant="secondary" onClick={() => grid.current?.api.exportDataAsCsv({ fileName: "pact-audit.csv" })}>
           <Download className="h-4 w-4" /> Export CSV
         </Button>
       </div>
-      <div style={{ height: 580 }} role="region" aria-label="Listing audit table. Press Enter on a PASS or FLAG row to buy it.">
+      <div style={{ height: 420 }} role="region" aria-label="Audit table. Press Enter on a Match or Check first row to buy it.">
         <AgGridReact<Row>
           ref={grid}
           theme={theme}
@@ -217,8 +180,7 @@ export function AuditGrid({ results, onSelect }: { results: ListingResult[]; onS
         />
       </div>
       <p className="mt-2 text-xs text-muted">
-        Click a PASS or FLAG row, or focus it and press Enter, to buy it. BLOCK rows can&apos;t be selected. Sort, filter or export the audit for a
-        record.
+        Click a Match or Check first row, or focus it and press Enter, to buy it. Blocked rows can&apos;t be selected.
       </p>
     </div>
   );

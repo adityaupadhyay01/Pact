@@ -112,9 +112,37 @@ function scan(text: string, location: "hidden" | "visible"): InjectionFinding[] 
 }
 
 export function detectInjection(html: string): InjectionReport {
-  const hidden = hiddenSegments(html);
+  return detectInjectionInText(visibleText(html), hiddenSegments(html));
+}
+
+/**
+ * Same checks for plain catalog text: `visible` is everything a buyer sees
+ * (title, description, features, attributes); `hidden` is text buyers can't see.
+ * An optional model-detected instruction quote escalates to high.
+ */
+export function detectInjectionInText(visible: string, hidden: string[], modelQuote: string | null = null): InjectionReport {
+  const report = scanAll(visible, hidden);
+  if (modelQuote && report.severity !== "high") {
+    return {
+      severity: "high",
+      findings: [
+        ...report.findings,
+        {
+          rule: "model-detected-instruction",
+          description: "Text addressed to AI agents (found while reading the listing)",
+          excerpt: modelQuote.slice(0, 200),
+          location: hidden.some((h) => h.includes(modelQuote)) ? "hidden" : "visible",
+          severity: "high",
+        },
+      ],
+    };
+  }
+  return report;
+}
+
+function scanAll(visible: string, hidden: string[]): InjectionReport {
   const findings: InjectionFinding[] = [
-    ...scan(visibleText(html), "visible"),
+    ...scan(visible, "visible"),
     ...hidden.flatMap((h) => scan(h, "hidden")),
   ];
 

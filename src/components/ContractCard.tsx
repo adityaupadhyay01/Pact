@@ -1,27 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import { Lock, PenLine, Search } from "lucide-react";
-import type { Requirements } from "@/lib/contract";
+import { Lock, PenLine, Search, Trash2 } from "lucide-react";
+import type { Constraint } from "@/lib/contract";
+import { describeRequirement } from "@/lib/rules";
 import { Button, Details, Step, type StepControl, money, shortHash } from "./ui";
 import type { SessionView } from "./api";
 
-const fmtStorage = (gb: number) => (gb >= 1000 ? `${gb / 1000}TB` : `${gb}GB`);
-const fmtWarranty = (m: number) => (m % 12 === 0 ? `${m / 12}-year` : `${m}-month`);
-
-/** The buyer's binding rules as plain sentences, e.g. "At least 16GB of RAM". */
-function mustHaves(r: Requirements): { label: string; value: string }[] {
-  return [
-    r.ramGbMin !== null ? { label: "Memory", value: `At least ${r.ramGbMin}GB of RAM` } : null,
-    r.storageGbMin !== null ? { label: "Storage", value: `At least ${fmtStorage(r.storageGbMin)} of storage` } : null,
-    r.warrantyMonthsMin !== null ? { label: "Warranty", value: `At least a ${fmtWarranty(r.warrantyMonthsMin)} warranty` } : null,
-    {
-      label: "Condition",
-      value: r.condition === "new" ? "Brand new (no refurbished or used)" : "New, refurbished or used is fine",
-    },
-    { label: "Budget", value: `Total price up to ${money(r.maxTotal, r.currency)}, including tax, shipping and fees` },
-  ].filter((x): x is { label: string; value: string } => Boolean(x));
-}
+const CURRENCIES = ["USD", "EUR", "GBP", "CAD", "AUD", "CHF", "SEK", "PLN", "CZK", "RON"];
 
 export function ContractCard({
   control,
@@ -33,14 +19,34 @@ export function ContractCard({
   control: StepControl;
   session: SessionView;
   onApprove: () => void;
-  onRevise: (patch: Partial<Requirements>) => void;
+  onRevise: (patch: { budget?: { max: number; currency: string } | null; constraints?: Constraint[] }) => void;
   busy: string | null;
 }) {
   const c = session.contract;
   const r = c.requirements;
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(r);
-  const num = (v: string) => (v.trim() === "" ? null : Number(v));
+  const [draft, setDraft] = useState<Constraint[]>(r.constraints);
+  const [budgetMax, setBudgetMax] = useState(r.budget ? String(r.budget.max) : "");
+  const [currency, setCurrency] = useState(r.budget?.currency ?? "USD");
+  const must = r.constraints.filter((x) => x.mandatory);
+  const nice = r.constraints.filter((x) => !x.mandatory);
+  const needsBudget = !r.budget;
+  const budgetValue = Number(budgetMax);
+  const budgetValid = budgetMax.trim() !== "" && Number.isFinite(budgetValue) && budgetValue > 0;
+
+  const saveBudget = () => budgetValid && onRevise({ budget: { max: budgetValue, currency } });
+
+  const row = (x: Constraint) => (
+    <div key={x.id} className="grid gap-x-6 gap-y-0.5 border-b border-line py-2.5 sm:grid-cols-[10rem_minmax(0,1fr)]">
+      <dt className="text-sm text-muted">{x.label}</dt>
+      <dd>
+        <span className="num text-[15px] text-ink">{describeRequirement(x)}</span>
+        <span className="mt-0.5 block text-xs text-muted">
+          {x.origin === "edited" ? "Changed by you" : <>You said: “{x.userQuote}”</>}
+        </span>
+      </dd>
+    </div>
+  );
 
   return (
     <Step
@@ -49,9 +55,9 @@ export function ContractCard({
       subtitle={
         session.approved
           ? "Your agent may only buy something that follows these."
-          : "This is what PACT understood from your request. Check it, fix anything wrong, then confirm."
+          : "This is what PACT understood from your request. Every item quotes your own words. Check it, fix anything wrong, then confirm."
       }
-      next="Your shopping agent searches the store and picks a product. PACT then checks that pick against these requirements. Nothing is bought or charged."
+      next="PACT searches for products, your shopping agent picks one, and PACT checks that pick against these requirements. Nothing is bought or charged."
     >
       <div className="p-5 sm:p-6">
         {!editing ? (
@@ -61,66 +67,131 @@ export function ContractCard({
                 <Lock className="h-3 w-3" /> Must have
               </h3>
               <dl className="mt-3 border-t border-line">
-                {mustHaves(r).map((row) => (
-                  <div key={row.label} className="grid gap-x-6 gap-y-0.5 border-b border-line py-2.5 sm:grid-cols-[7rem_minmax(0,1fr)]">
-                    <dt className="text-sm text-muted">{row.label}</dt>
-                    <dd className="num text-[15px] text-ink">{row.value}</dd>
-                  </div>
-                ))}
+                <div className="border-b border-line py-2.5 sm:grid sm:grid-cols-[10rem_minmax(0,1fr)] sm:gap-x-6">
+                  <dt className="text-sm text-muted">Product</dt>
+                  <dd className="text-[15px] text-ink">{r.product}</dd>
+                </div>
+                {must.map(row)}
+                <div className="grid gap-x-6 gap-y-0.5 py-2.5 sm:grid-cols-[10rem_minmax(0,1fr)]">
+                  <dt className="text-sm text-muted">Budget</dt>
+                  <dd>
+                    {r.budget ? (
+                      <>
+                        <span className="num text-[15px] text-ink">Item price up to {money(r.budget.max, r.budget.currency)}</span>
+                        <span className="mt-0.5 block text-xs text-muted">
+                          {r.budget.origin === "edited" ? "Set by you" : <>You said: “{r.budget.userQuote}”</>}. Shipping, tax and the
+                          merchant&apos;s checkout total are not verified.
+                        </span>
+                      </>
+                    ) : (
+                      <form
+                        className="mt-1 flex flex-wrap items-end gap-2"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          saveBudget();
+                        }}
+                      >
+                        <p className="w-full text-sm text-flag">
+                          You didn&apos;t mention a budget. PACT won&apos;t guess one: what&apos;s the most you want to pay?
+                        </p>
+                        <label className="text-sm">
+                          <span className="sr-only">Maximum item price</span>
+                          <input
+                            id="budget-input"
+                            type="number"
+                            min={0.01}
+                            step="0.01"
+                            inputMode="decimal"
+                            className="input num w-32"
+                            value={budgetMax}
+                            onChange={(e) => setBudgetMax(e.target.value)}
+                            placeholder="e.g. 50"
+                          />
+                        </label>
+                        <label className="text-sm">
+                          <span className="sr-only">Currency</span>
+                          <select className="input w-24" value={currency} onChange={(e) => setCurrency(e.target.value)}>
+                            {CURRENCIES.map((cur) => (
+                              <option key={cur}>{cur}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <Button type="submit" variant="secondary" disabled={!budgetValid} loading={busy === "revise"}>
+                          Set budget
+                        </Button>
+                      </form>
+                    )}
+                  </dd>
+                </div>
               </dl>
-              <p className="mt-2 text-xs text-muted">
-                If a product breaks any of these, PACT blocks it. If you change one later, you confirm again.
-              </p>
+              {must.length === 0 && (
+                <p className="mt-2 text-xs text-muted">
+                  No specific must-haves were found in your request, so PACT will only check the price, availability and the
+                  seller&apos;s text.
+                </p>
+              )}
             </section>
             <section aria-labelledby="nice-title">
               <h3 id="nice-title" className="eyebrow text-muted">
                 Nice to have
               </h3>
-              {r.preferences.length ? (
-                <ul className="mt-3 border-t border-line">
-                  {r.preferences.map((p) => (
-                    <li key={p} className="border-b border-line py-2.5 text-[15px] text-ink-2">
-                      {p}
-                    </li>
-                  ))}
-                </ul>
+              {nice.length ? (
+                <dl className="mt-3 border-t border-line">{nice.map(row)}</dl>
               ) : (
-                <p className="mt-3 border-t border-line pt-2.5 text-sm text-muted">
-                  None. Add preferences like “lightweight” if you have them. They never block a purchase.
-                </p>
+                <p className="mt-3 border-t border-line pt-2.5 text-sm text-muted">None. Nice-to-haves never block a purchase.</p>
               )}
             </section>
           </div>
         ) : (
-          <fieldset className="grid gap-4 sm:grid-cols-2">
-            <legend className="eyebrow mb-3 text-ink">Edit your requirements</legend>
-            <Field label="Minimum RAM (GB)">
-              <input type="number" min={1} className="input num" defaultValue={draft.ramGbMin ?? ""}
-                onChange={(e) => setDraft({ ...draft, ramGbMin: num(e.target.value) })} />
-            </Field>
-            <Field label="Minimum storage (GB)">
-              <input type="number" min={1} className="input num" defaultValue={draft.storageGbMin ?? ""}
-                onChange={(e) => setDraft({ ...draft, storageGbMin: num(e.target.value) })} />
-            </Field>
-            <Field label="Minimum warranty (months)">
-              <input type="number" min={0} className="input num" defaultValue={draft.warrantyMonthsMin ?? ""}
-                onChange={(e) => setDraft({ ...draft, warrantyMonthsMin: num(e.target.value) })} />
-            </Field>
-            <Field label="Max total price">
-              <input type="number" min={1} className="input num" defaultValue={draft.maxTotal}
-                onChange={(e) => setDraft({ ...draft, maxTotal: Number(e.target.value) || draft.maxTotal })} />
-            </Field>
-            <Field label="Condition">
-              <select className="input" defaultValue={draft.condition}
-                onChange={(e) => setDraft({ ...draft, condition: e.target.value as "new" | "any" })}>
-                <option value="new">Brand new only</option>
-                <option value="any">Refurbished or used is fine</option>
-              </select>
-            </Field>
-            <Field label="Nice to have (optional, comma separated)">
-              <input className="input" defaultValue={draft.preferences.join(", ")} placeholder="e.g. lightweight"
-                onChange={(e) => setDraft({ ...draft, preferences: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })} />
-            </Field>
+          <fieldset className="space-y-4">
+            <legend className="eyebrow mb-1 text-ink">Edit your requirements</legend>
+            {draft.length === 0 && <p className="text-sm text-muted">No requirements to edit.</p>}
+            {draft.map((x, i) => (
+              <div key={x.id} className="grid items-end gap-3 border-b border-line pb-3 sm:grid-cols-[minmax(0,1fr)_8rem_7rem_auto]">
+                <p className="text-sm text-ink-2">
+                  {x.label} <span className="text-muted">({x.operator === "present" ? "has" : x.operator})</span>
+                </p>
+                <label className="text-xs text-muted">
+                  Value
+                  <input
+                    className="input mt-1"
+                    disabled={x.operator === "present"}
+                    defaultValue={x.value ?? ""}
+                    aria-label={`${x.label} value`}
+                    onChange={(e) => setDraft(draft.map((y, j) => (j === i ? { ...y, value: e.target.value || null } : y)))}
+                  />
+                </label>
+                <label className="flex items-center gap-2 text-sm text-ink-2">
+                  <input
+                    type="checkbox"
+                    checked={x.mandatory}
+                    onChange={(e) => setDraft(draft.map((y, j) => (j === i ? { ...y, mandatory: e.target.checked } : y)))}
+                  />
+                  Must have
+                </label>
+                <Button variant="ghost" aria-label={`Remove ${x.label}`} onClick={() => setDraft(draft.filter((_, j) => j !== i))}>
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
+            ))}
+            <label className="block max-w-xs text-sm font-medium text-ink-2">
+              Max item price
+              <div className="mt-1.5 flex gap-2">
+                <input
+                  type="number"
+                  min={0.01}
+                  step="0.01"
+                  className="input num"
+                  value={budgetMax}
+                  onChange={(e) => setBudgetMax(e.target.value)}
+                />
+                <select className="input w-24" value={currency} onChange={(e) => setCurrency(e.target.value)} aria-label="Currency">
+                  {CURRENCIES.map((cur) => (
+                    <option key={cur}>{cur}</option>
+                  ))}
+                </select>
+              </div>
+            </label>
           </fieldset>
         )}
 
@@ -128,52 +199,67 @@ export function ContractCard({
           {!editing ? (
             <>
               {!session.approved && (
-                <Button id="approve-contract" onClick={onApprove} loading={busy === "approve"}>
-                  <Search className="h-4 w-4" /> {busy === "approve" ? "Running the check…" : "Looks right, run the check"}
+                <Button id="approve-contract" onClick={onApprove} loading={busy === "approve"} disabled={needsBudget}>
+                  <Search className="h-4 w-4" /> {busy === "approve" ? "Starting the check…" : "Looks right, run the check"}
                 </Button>
               )}
-              <Button variant="secondary" onClick={() => { setDraft(r); setEditing(true); }}>
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setDraft(r.constraints);
+                  setEditing(true);
+                }}
+              >
                 <PenLine className="h-4 w-4" /> Change requirements
               </Button>
+              {needsBudget && <span className="text-sm text-muted">Set a budget to continue.</span>}
             </>
           ) : (
             <>
-              <Button onClick={() => { onRevise(draft); setEditing(false); }} loading={busy === "revise"}>
+              <Button
+                onClick={() => {
+                  onRevise({
+                    constraints: draft,
+                    ...(budgetValid ? { budget: { max: budgetValue, currency } } : {}),
+                  });
+                  setEditing(false);
+                }}
+                loading={busy === "revise"}
+              >
                 Save changes
               </Button>
-              <Button variant="ghost" onClick={() => setEditing(false)}>Cancel</Button>
+              <Button variant="ghost" onClick={() => setEditing(false)}>
+                Cancel
+              </Button>
             </>
           )}
         </div>
 
         <Details summary="Show details" className="mt-6">
-          <dl className="grid gap-x-6 gap-y-1.5 border-l-2 border-line pl-3 text-xs text-muted sm:grid-cols-[7rem_minmax(0,1fr)]">
+          <dl className="grid gap-x-6 gap-y-1.5 border-l-2 border-line pl-3 text-xs text-muted sm:grid-cols-[8rem_minmax(0,1fr)]">
             <dt className="eyebrow text-faint">Your words</dt>
             <dd>“{session.requestText}”</dd>
             <dt className="eyebrow text-faint">Read by</dt>
-            <dd>{session.parseEngine === "gemini" ? "Gemini" : "Rule-based parser (no Gemini key set)"}</dd>
+            <dd>{session.intent.engine === "gemini" ? "Gemini (Google AI)" : "Test-store reader (no AI, laptops only)"}</dd>
+            {session.intent.dropped.length > 0 && (
+              <>
+                <dt className="eyebrow text-faint">Ignored</dt>
+                <dd>
+                  {session.intent.dropped.map((d) => `${d.what} (${d.reason})`).join("; ")}. PACT only keeps what you actually
+                  said.
+                </dd>
+              </>
+            )}
+            <dt className="eyebrow text-faint">Search text</dt>
+            <dd>“{r.searchQuery}”</dd>
             <dt className="eyebrow text-faint">Version</dt>
             <dd className="num">
-              {c.version}
-              {session.contracts.length > 1 && ` (${session.contracts.length - 1} earlier)`}
-            </dd>
-            <dt className="eyebrow text-faint">Fingerprint</dt>
-            <dd>
-              <span className="num font-mono">{shortHash(c.hash)}</span>. Your confirmation is tied to this exact
-              version, so nobody can change the rules after you agree.
+              {c.version}, fingerprint <span className="font-mono">{shortHash(c.hash)}</span>. Your confirmation is tied to this
+              exact version.
             </dd>
           </dl>
         </Details>
       </div>
     </Step>
-  );
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <label className="block text-sm font-medium text-ink-2">
-      {label}
-      <div className="mt-1.5">{children}</div>
-    </label>
   );
 }

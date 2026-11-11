@@ -20,7 +20,7 @@ test("landing page has no serious accessibility violations", async ({ page }) =>
 
 test("full workflow has no serious accessibility violations", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "Watch a 10-second demo" }).click();
+  await page.getByRole("button", { name: "Watch a quick demo" }).click();
   await expect(page.locator("#decision-primary")).toBeVisible({ timeout: 20_000 });
   await page.getByRole("button", { name: "Show all" }).click();
   // Scan the layout from the top, not from wherever the demo scrolled to (the sticky bar would overlap content).
@@ -59,7 +59,11 @@ test("primary flow works with the keyboard only", async ({ page }) => {
     throw new Error(`Could not reach "${name}" with Tab`);
   };
 
-  // From the top of the page, the primary action is a few Tabs away (the text box and the example chips come first).
+  await page.getByRole("radio", { name: /Test store/ }).check();
+  await page
+    .getByLabel("What do you want to buy?")
+    .fill("Find me a new laptop with 16GB RAM, 1TB SSD and a two-year warranty. Maximum price $900.");
+  // From the text box, the primary action is a few Tabs away (the example chips and Seller Mode come first).
   await press("Check my purchase", 0);
   // After each action, focus moves straight to the next control: no tabbing needed.
   expect(await press("Looks right, run the check")).toBe(0);

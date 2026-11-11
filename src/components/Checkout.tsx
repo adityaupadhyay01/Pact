@@ -3,9 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { BadgeCheck, ShieldX } from "lucide-react";
-import { getListing } from "@/lib/marketplace";
-import { quoteTotal } from "@/lib/quote";
 import { ChecksList } from "./Checks";
+import { findVerified } from "./flow";
 import { Button, Details, focusSoon, Step, type StepControl, money, shortHash } from "./ui";
 import { sessionAction, type SessionView } from "./api";
 
@@ -13,6 +12,8 @@ export interface AppConfig {
   paypal: "sandbox" | "simulated";
   paypalClientId: string | null;
   ai: boolean;
+  aiModel: string | null;
+  catalog: boolean;
   storage: string;
 }
 
@@ -31,14 +32,15 @@ export function Checkout({
   setSession: (s: SessionView) => void;
   onError: (msg: string) => void;
 }) {
-  const listing = getListing(selectedId)!;
-  const result = session.search?.results.find((r) => r.listingId === selectedId);
+  const result = findVerified(session, selectedId);
   const [acks, setAcks] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   if (!result) return null;
 
-  const q = listing.checkout;
-  const flags = result.evaluation.checks.filter((c) => c.status === "flag" && c.id !== "agent-claim");
+  const product = result.record;
+  const q = { currency: product.offer.currency, itemPrice: product.offer.price };
+  // Every "check first" item needs the buyer's OK, including an agent claim the listing doesn't back up.
+  const flags = result.evaluation.checks.filter((c) => c.status === "flag");
   const snap = session.snapshot?.listingId === selectedId ? session.snapshot : null;
   const order = snap ? session.order : null;
   const captured = order?.status === "COMPLETED";
@@ -59,7 +61,7 @@ export function Checkout({
 
   const approvePurchase = () =>
     run(async () => {
-      setSession(await sessionAction(session.id, "purchase", { listingId: selectedId, acknowledgedFlags: acks }));
+      setSession(await sessionAction(session.id, "purchase", { productId: selectedId, acknowledgedFlags: acks }));
       focusSoon("pay-button");
     });
 
@@ -71,12 +73,12 @@ export function Checkout({
       focusSoon("payment-result");
     });
 
-  const total = quoteTotal(q);
+  const total = snap ? snap.quote.itemPrice : q.itemPrice;
   const orderTotal = order?.paypal ? Number(order.paypal.total) : null;
 
   // Where the buyer is in the payment, in words (never colour alone).
   const stages = [
-    { label: "Confirm the total", done: Boolean(snap) },
+    { label: "Confirm the price", done: Boolean(snap) },
     { label: "Approve in PayPal", done: Boolean(captured || blocked) },
     { label: "PACT checks the PayPal order, then charges", done: Boolean(captured || blocked) },
   ];
@@ -94,22 +96,26 @@ export function Checkout({
           <h3 id="order-title" className="eyebrow text-muted">
             Your order
           </h3>
-          <p className="mt-2 text-xl font-semibold tracking-[-0.01em] text-ink">{listing.title}</p>
-          <p className="text-sm text-muted">Sold by {listing.seller}</p>
+          <p className="mt-2 text-xl font-semibold tracking-[-0.01em] text-ink">{product.title}</p>
+          <p className="text-sm text-muted">Sold on {product.offer.domain}</p>
+          {(session.isTest || product.synthetic) && (
+            <p className="eyebrow mt-2 inline-block border border-flag-line bg-flag-soft px-1.5 py-0.5 text-flag">
+              TEST purchase: fictional or altered product
+            </p>
+          )}
 
           <dl className="mt-5 border-t border-ink text-sm">
-            <Row label="Price" value={money(q.itemPrice, q.currency)} />
-            <Row label="Shipping" value={q.shipping ? money(q.shipping, q.currency) : "Free"} />
-            <Row label="Tax" value={money(q.tax, q.currency)} />
-            {q.fees.map((f) => (
-              <Row key={f.label} label={f.label} value={money(f.amount, q.currency)} warn />
-            ))}
-            {q.recurring && <Row label="Subscription" value={q.recurring} warn />}
+            <Row label="Condition" value={product.offer.condition ?? "Not stated"} />
+            <Row label="Availability" value={product.offer.availability.replace(/([a-z])([A-Z])/g, "$1 $2")} />
             <div className="flex items-baseline justify-between gap-4 border-t border-ink pt-3">
-              <dt className="font-semibold text-ink">Total</dt>
+              <dt className="font-semibold text-ink">Item price</dt>
               <dd className="num font-mono text-2xl font-medium text-ink">{money(total, q.currency)}</dd>
             </div>
           </dl>
+          <p className="mt-2 text-xs text-muted">
+            PACT verifies the item price only. Shipping, tax and the merchant&apos;s own checkout total are not verified.
+            This demo charges the item price through PayPal Sandbox; it does not place an order with the merchant.
+          </p>
 
           {!snap && flags.length > 0 && (
             <fieldset className="mt-6 border-l-2 border-flag-icon bg-flag-soft px-4 py-3">
@@ -171,7 +177,7 @@ export function Checkout({
           </ol>
 
           {!snap && (
-            <p className="mt-4 text-sm text-muted">Confirm the total first. Then you&apos;ll pay with PayPal.</p>
+            <p className="mt-4 text-sm text-muted">Confirm the price first. Then you&apos;ll pay with PayPal.</p>
           )}
 
           {snap && !captured && !blocked && (
@@ -241,7 +247,7 @@ export function Checkout({
                         : "The PayPal order didn't match what you confirmed, so PACT stopped it."}
                     </p>
                     <a href="#step-decision" className="mt-2 inline-block text-sm font-medium text-ink underline underline-offset-2">
-                      Choose a different laptop
+                      Choose a different product
                     </a>
                   </>
                 )}

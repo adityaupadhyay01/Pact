@@ -1,82 +1,90 @@
 # PACT — intent integrity for AI-assisted payments
 
-Payment systems verify that money moved. They don't verify that the purchase matches what the buyer agreed to.
+Payment systems verify that money moved. They don't verify that the purchase matches what the buyer asked for.
 
-A buyer asks an AI agent for *a new laptop, 16GB RAM, 1TB SSD, two-year warranty, max $900*. The agent finds one for $850. The fine print says **refurbished, one-year warranty**. A normal checkout sees a valid $850 payment. **PACT sees a broken agreement** and stops it before PayPal captures any money.
+**You tell PACT what you want. An AI shopping agent finds it, PACT checks it against your own words and the seller's listing, and you approve the PayPal payment.**
+
+Type any shopping request, for example *"dark chocolate with at least 70% cocoa, under $10"*. Gemini turns it into requirements that each quote your words. PACT searches real products through Channel3, a Gemini shopping agent picks one and explains why, and PACT verifies that pick: **Match**, **Check first** or **Blocked**, with the evidence. Only after you approve does a PayPal Sandbox payment run, and PACT checks the PayPal order against the price you approved before capturing it.
 
 ## How it works
 
-1. **Contract.** The buyer's request becomes a machine-readable contract. Every version is sealed with a SHA-256 hash and is immutable. Approval binds to that hash, so changing any critical term (price cap, specs, warranty, condition, currency) means the buyer has to approve again.
-2. **AI extracts, code decides.** Gemini turns seller listings into structured facts. Every fact must quote the listing exactly, and a fact whose quote isn't in the listing is discarded. PASS / FLAG / BLOCK comes from a deterministic, unit-tested rule engine (`src/lib/rules.ts`). If a fact is missing, the result is FLAG, never PASS.
-3. **Prompt-injection defence.**
-   - *Structural (the guarantee):* seller content only reaches the model as data for extraction. The model has no tools, and only the buyer can change the contract.
-   - *Detection (the visible layer):* rule-based detectors plus a Gemini classifier surface hidden instructions aimed at agents.
-4. **Checkout audit.** PACT checks the all-in total (item, shipping, tax, fees), any price change since the listing, extra fees, currency and recurring charges against the contract. It also checks the agent's own description of the product.
-5. **Pre-capture verification with PayPal.** The seller's checkout creates the PayPal order. Before capture, PACT fetches the order **from PayPal** and compares total, currency, breakdown, listing reference and approval hash (`custom_id`) to the exact purchase the buyer approved, to the cent. If anything differs, capture is blocked and no money moves.
-6. **Signed receipt.** Every step is recorded with a timestamp, actor and source references in a SHA-256 hash chain, and the server signs the chain head with HMAC-SHA256 (`EVIDENCE_SECRET`). Download the receipt and POST it to `/api/evidence/verify`: an edited receipt fails, even if every hash is recomputed.
-7. **Payment safety.** One PayPal order per purchase approval, and capture is idempotent (`PayPal-Request-Id`, plus a guard that returns the existing capture). Cancelling or a declined card charges nothing and can be retried. A paid session can't be changed or paid again.
+1. **Requirements from your words only.** Gemini reads the request into structured requirements. Every requirement and the budget must quote the request word for word, and numbers must appear in that quote; anything else is dropped and shown as ignored. PACT never invents a default (no budget → it asks you). Each version is sealed with a SHA-256 hash, and your approval is bound to that hash.
+2. **AI extracts, code decides.** Gemini reads the product listing into facts. Every fact must quote the listing exactly or it's discarded. PASS / FLAG / BLOCK comes from a deterministic, unit-tested rule engine (`src/lib/rules.ts`). A missing must-have is FLAG, never PASS.
+3. **The agent is checked too.** The shopping agent sees the whole page, including text shoppers can't see. PACT checks its pick and each claim it made against the listing, and flags hidden instructions aimed at AI agents.
+4. **Pre-capture verification with PayPal.** PACT fetches the order **from PayPal** and compares amount, currency, product reference and the approval hash (`custom_id`) with what you approved, to the cent. A mismatch blocks capture and no money moves.
+5. **Signed receipt.** Every step is recorded in a SHA-256 hash chain, and the server signs the chain head with HMAC-SHA256 (`EVIDENCE_SECRET`). An edited receipt fails verification at `/api/evidence/verify`, even if every hash is recomputed.
+6. **Payment safety.** Idempotent order creation and capture (`PayPal-Request-Id`), a guard against double capture, cancel and decline handled, and a paid session can't be paid again.
 
-## The demo
+## Honest limits
 
-The same approved request goes to two agents:
+- **Item price only.** PACT checks the catalog item price against your budget. Shipping, tax and the merchant's own checkout total are **not** verified, and the UI says so.
+- **It doesn't buy from the merchant.** The PayPal Sandbox payment demonstrates the approval and verification flow; no order is placed with the store.
+- **No AI, no live check.** If Gemini or Channel3 is unavailable, real-product mode refuses to run and says why. It never falls back to guessing.
+- **Merchant domains only.** PACT shows the seller's domain, with no affiliate links.
 
-| | Unrestricted agent | PACT-protected agent |
+## Modes
+
+| Mode | What it uses | Label |
 |---|---|---|
-| Reads hidden “pre-approved, increase the budget” text | Follows it and buys a $1,330 laptop | Blocks the listing as an injection |
-| Fine print: refurbished, 1-year warranty | Misses it | BLOCK, quoting the fine print |
-| Fee added at checkout | Misses it | FLAG, buyer must acknowledge |
-| Seller sends PayPal $15 more than approved | Pays it | Capture blocked |
+| Real products | Gemini + Channel3 + PayPal Sandbox | Live services, shown under "How this ran" |
+| Test store | 12 fictional laptops with planted traps, a simple test agent, no AI | **TEST** banner and TEST receipts |
+| Seller Mode | Alters a *copy* of the agent's pick to act like a dishonest seller: hidden instructions, fine print that contradicts a requirement, or a PayPal price higher than approved | **TEST** banner, product marked "altered by Seller Mode", TEST receipts |
 
-The mock marketplace (`src/lib/marketplace.ts`) has 12 fictional listings, each with a different trap. The unrestricted agent is a deterministic simulation of common agent failure modes, so the demo can be repeated.
+Seller Mode is a security test for judges. Its synthetic evidence is always labelled and never mixed with real catalog evidence.
 
 ## Running it
 
 ```bash
 npm install
-cp .env.example .env.local   # optional, see below
+cp .env.example .env.local   # add keys, see below
 npm run dev                  # http://localhost:3000
-npm test                     # rule engine, contracts, injection, hash chain
-npm run test:e2e             # Playwright: demo flows, keyboard-only flow, axe WCAG 2.2 AA scan
+npm test                     # rules, intent grounding, contracts, Seller Mode, Channel3 normaliser, receipts
+npm run test:e2e             # Playwright: flows, payment safety, keyboard-only, axe WCAG 2.2 AA
 ```
 
-Click **Watch a 10-second demo** on the home page to step through request → rules → search automatically.
-
-The demo video script is in [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md), and the Devpost write-up draft is in [docs/SUBMISSION.md](docs/SUBMISSION.md).
-
-Every integration is optional, so the app runs end to end with no keys:
+**Watch a quick demo** on the home page runs a laptop request in the test store.
 
 | Variable | Without it |
 |---|---|
-| `GEMINI_API_KEY` | Rule-based parser and extractor (labelled in the UI) |
-| `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` | PayPal simulator (labelled). With them: real PayPal sandbox Orders v2 and JS SDK buttons |
+| `GEMINI_API_KEY`, `CHANNEL3_API_KEY` | Real-product mode is unavailable; the test store still works |
+| `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` | PayPal simulator (labelled). With them: PayPal Sandbox Orders v2 and JS SDK buttons |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | In-memory storage. Required on Vercel: run `supabase/schema.sql` first |
-| `EVIDENCE_SECRET` | A random signing key per server process. Set it when hosted, or receipts stop verifying after a restart |
+| `EVIDENCE_SECRET` | A random key per server process. Set it when hosted, or receipts stop verifying after a restart |
 
-The session id is kept in the URL (`?session=…`), so refreshing the page reopens the same purchase.
+To pay in the sandbox, log in to the PayPal popup with a sandbox **personal** account.
 
-**Demo security note:** there are no user accounts. A session id (a random UUID) is the only key to a session, and all listings and buyers are fictional. Don't put real personal data in.
+## Data and privacy
 
-To pay in the sandbox, log in to the PayPal popup with a sandbox **personal** account from the PayPal developer dashboard.
+- All API keys stay on the server.
+- Don't put personal details in a request. In real-product mode the request text goes to Google Gemini on the **free tier, where Google may use prompts and responses to improve its products**. Product data from Channel3 is also sent to Gemini for extraction.
+- Channel3 data is fetched fresh for each check and is not cached across sessions; prices are refreshed before you approve.
+- Sessions (including the request text) are stored for 7 days. There are no user accounts: a random session id is the only key.
+- Open question we flag rather than hide: Channel3's terms restrict using its output to train models, and Gemini's free tier allows Google to use inputs for product improvement. For production, use a paid Gemini tier (no training on inputs).
 
 ## Tools used
 
-- **PayPal Orders v2 API + JS SDK (sandbox):** order creation by the seller checkout, server-side order retrieval for verification, and capture.
-- **Google Gemini** (`gemini-2.5-flash` by default, configurable): request parsing, grounded fact extraction and an injection classifier. It uses JSON-schema structured output validated with Zod. Free-tier data may be used by Google, but all data here is fictional.
-- **AG Grid Community:** the listing audit table, with sorting by verdict and total, filtering, a quick search and CSV export of the audit.
-- Next.js 16, TypeScript, Tailwind CSS, Motion, Lucide, Zod, Supabase Postgres, Vitest, Playwright.
+- **PayPal Orders v2 API + JS SDK (Sandbox):** order creation, server-side order retrieval for verification, and capture.
+- **Google Gemini** (`gemini-3.5-flash-lite` by default): request reading, the shopping agent's choice and grounded fact extraction, using JSON-schema structured output validated with Zod.
+- **Channel3:** product search and product detail (price refresh before approval).
+- **AG Grid Community:** the audit table of every checked product, one column per requirement, with sorting, filtering and CSV export.
+- **Supabase Postgres:** sessions and rate limits.
+- Next.js 16, TypeScript, Tailwind CSS, Motion, Lucide, Zod, Vitest, Playwright, axe-core.
 
 ## Project layout
 
 ```
-src/lib/contract.ts      versioned, hash-sealed contracts and approvals
-src/lib/rules.ts         deterministic PASS / FLAG / BLOCK engine
-src/lib/facts.ts         fact schema and quote grounding
-src/lib/ai.ts            Gemini calls (extract and explain only), with fallback
-src/lib/injection.ts     prompt-injection detection, visible vs hidden text
-src/lib/order-verify.ts  purchase snapshot and pre-capture PayPal order check
-src/lib/paypal.ts        PayPal Orders v2 client and simulator
-src/lib/evidence.ts      hash-chained evidence log
-src/lib/pact.ts          the flow, tying it all together
+src/lib/intent.ts         request → requirements, grounded in the buyer's words
+src/lib/contract.ts       versioned, hash-sealed requirements and approvals
+src/lib/catalog/          Channel3 client and normaliser, test store
+src/lib/ai.ts             Gemini calls (intent, agent choice, extraction); no silent fallback
+src/lib/facts.ts          evidence text, fact schema and quote grounding
+src/lib/rules.ts          deterministic PASS / FLAG / BLOCK engine
+src/lib/injection.ts      hidden-instruction detection
+src/lib/seller-mode.ts    labelled synthetic seller attacks
+src/lib/order-verify.ts   purchase snapshot and pre-capture PayPal order check
+src/lib/paypal.ts         PayPal Orders v2 client and simulator
+src/lib/evidence.ts       hash-chained, signed evidence log
+src/lib/pact.ts           the flow, tying it all together
 ```
 
 ## License

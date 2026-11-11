@@ -6,10 +6,12 @@ import {
   cancelPayment,
   capture,
   createPaypalOrder,
+  discover,
   PactError,
   revise,
-  search,
+  select,
   simulateApproval,
+  verify,
 } from "@/lib/pact";
 
 export const maxDuration = 60;
@@ -22,13 +24,18 @@ export async function POST(req: NextRequest, ctx: RouteContext<"/api/session/[id
       case "approve":
         return approveContract(id, String(b.contractHash ?? ""));
       case "revise":
-        return revise(id, (b.patch ?? {}) as Record<string, unknown>);
-      case "search":
-        return search(id);
+        return revise(id, (b.patch ?? {}) as Parameters<typeof revise>[1]);
+      // The check runs as three steps so the UI can show progress and retry one step.
+      case "discover":
+        return discover(id);
+      case "select":
+        return select(id);
+      case "verify":
+        return verify(id);
       case "purchase":
         return approvePurchase(
           id,
-          String(b.listingId ?? ""),
+          String(b.productId ?? b.listingId ?? ""),
           Array.isArray(b.acknowledgedFlags) ? b.acknowledgedFlags.map(String) : [],
         );
       case "order":

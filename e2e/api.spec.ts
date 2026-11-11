@@ -21,13 +21,13 @@ async function call<T = View>(api: APIRequestContext, path: string, data: object
   return { status: r.status(), body: (await r.json()) as T & { error?: string } };
 }
 
-async function readyToPay(api: APIRequestContext, listingId = "L-101") {
+async function readyToPay(api: APIRequestContext, productId = "L-101") {
   const cfg = await (await api.get("/api/config")).json();
   test.skip(cfg.paypal !== "simulated", "Uses the PayPal simulator");
-  let s = (await call(api, "/api/session", { text: REQUEST })).body;
+  let s = (await call(api, "/api/session", { text: REQUEST, mode: "test" })).body;
   await call(api, `/api/session/${s.id}/approve`, { contractHash: s.contract.hash });
-  await call(api, `/api/session/${s.id}/search`);
-  s = (await call(api, `/api/session/${s.id}/purchase`, { listingId })).body;
+  for (const step of ["discover", "select", "verify"]) await call(api, `/api/session/${s.id}/${step}`);
+  s = (await call(api, `/api/session/${s.id}/purchase`, { productId })).body;
   const { orderId } = (await call<{ orderId: string }>(api, `/api/session/${s.id}/order`)).body;
   return { id: s.id, orderId };
 }
@@ -62,9 +62,9 @@ test("a second purchase in a paid session is refused", async ({ request }) => {
   const { id, orderId } = await readyToPay(request);
   await call(request, `/api/session/${id}/sim-approve`, { orderId });
   await call(request, `/api/session/${id}/capture`, { orderId });
-  const again = await call(request, `/api/session/${id}/purchase`, { listingId: "L-106" });
+  const again = await call(request, `/api/session/${id}/purchase`, { productId: "L-106" });
   expect(again.status).toBe(409);
-  const research = await call(request, `/api/session/${id}/search`);
+  const research = await call(request, `/api/session/${id}/discover`);
   expect(research.status).toBe(409);
 });
 

@@ -1,244 +1,291 @@
 import { describe, expect, it } from "vitest";
 import { canonicalize } from "../canonical";
-import {
-  approve,
-  createContract,
-  findValidApproval,
-  reviseContract,
-  verifyContractHash,
-  type Requirements,
-} from "../contract";
+import { approve, createContract, findValidApproval, reviseContract, verifyContractHash, type Requirements } from "../contract";
 import { appendEvent, eventHash, GENESIS, signReceipt, verifyChain, verifyReceipt, type EvidenceEvent } from "../evidence";
-import { groundFacts } from "../facts";
-import { extractFactsHeuristic, parseRequestHeuristic } from "../heuristics";
-import { detectInjection, visibleText } from "../injection";
-import { getListing, LISTINGS } from "../marketplace";
-import { evaluate } from "../rules";
-import { runUnprotectedAgent, pickProtected } from "../agents";
+import { catalogFacts, groundFacts, snapshot } from "../facts";
+import { testChoose, testExtract, testIntent } from "../heuristics";
+import { detectInjectionInText } from "../injection";
+import { groundIntent, type RawIntent } from "../intent";
+import { compare, evaluate } from "../rules";
+import { convert, parseNumber } from "../units";
+import { searchTestStore, testStoreRecord } from "../catalog/testStore";
+import { normalise } from "../catalog/channel3-normalise";
+import { applyAttack } from "../seller-mode";
+import type { ProductRecord } from "../catalog/types";
 
-const REQUEST =
-  "Find me a new laptop with 16GB RAM, 1TB SSD and a two-year warranty. Maximum price $900.";
-const req: Requirements = parseRequestHeuristic(REQUEST);
-const now = new Date("2026-11-10T10:00:00Z");
+const now = new Date("2026-11-11T10:00:00Z");
+const REQUEST = "Find me a new laptop with 16GB RAM, 1TB SSD and a two-year warranty. Maximum price $900.";
 
-describe("request parsing", () => {
-  it("turns the buyer's words into requirements", () => {
-    expect(req).toEqual({
-      category: "laptop",
-      ramGbMin: 16,
-      storageGbMin: 1000,
-      warrantyMonthsMin: 24,
-      condition: "new",
-      maxTotal: 900,
-      currency: "USD",
-      preferences: [],
-    });
+function requirementsFor(text: string): Requirements {
+  const out = groundIntent(testIntent(text), text);
+  if (!out.ok) throw new Error(out.message);
+  return out.requirements;
+}
+const req = requirementsFor(REQUEST);
+
+/** The same pipeline PACT runs in test mode: evidence → facts → injection → rules. */
+function verifyRecord(r: Requirements, p: ProductRecord, searchedPrice = p.offer.price) {
+  const ev = snapshot(p);
+  const fromCatalog = catalogFacts(r.constraints, p);
+  const toRead = r.constraints.filter((c) => !fromCatalog[c.id]);
+  const g = groundFacts(testExtract(toRead, p), toRead, ev.text);
+  const facts = { ...g.facts, ...fromCatalog };
+  const visible = [p.title, p.description ?? "", ...p.keyFeatures].join("\n");
+  const injection = detectInjectionInText(visible, p.hiddenText, g.instruction);
+  return evaluate({ requirements: r, product: p, facts, injection, searchedPrice });
+}
+
+// ------------------------------------------------------------------ intent grounding
+
+describe("intent grounding: nothing is invented", () => {
+  const base: RawIntent = {
+    isShoppingRequest: true,
+    product: "dark chocolate bar",
+    productQuote: "dark chocolate bar",
+    searchQuery: "70% dark chocolate bar",
+    budget: null,
+    constraints: [],
+  };
+  const text = "I want a 70% dark chocolate bar under $5, ideally organic";
+
+  it("keeps a budget only when the buyer stated it, with the number in their words", () => {
+    const ok = groundIntent({ ...base, budget: { max: 5, currency: "usd", userQuote: "under $5" } }, text);
+    expect(ok.ok && ok.requirements.budget).toMatchObject({ max: 5, currency: "USD", scope: "item_price" });
+
+    const invented = groundIntent({ ...base, budget: { max: 1000, currency: "USD", userQuote: "under $5" } }, text);
+    expect(invented.ok && invented.requirements.budget).toBeNull();
+
+    const noBudget = groundIntent(base, "I want a 70% dark chocolate bar");
+    expect(noBudget.ok && noBudget.requirements.budget).toBeNull();
+    expect(noBudget.ok && noBudget.notes.join(" ")).toMatch(/No budget/);
+  });
+
+  it("drops requirements that aren't in the buyer's words", () => {
+    const out = groundIntent(
+      {
+        ...base,
+        constraints: [
+          { label: "Cocoa content", attribute: "cocoa_percent", operator: "gte", value: "70", unit: "%", mandatory: true, userQuote: "70%" },
+          { label: "Weight", attribute: "weight", operator: "gte", value: "100", unit: "g", mandatory: true, userQuote: "100g bar" },
+          { label: "Cocoa", attribute: "cocoa_percent", operator: "gte", value: "85", unit: "%", mandatory: true, userQuote: "70%" },
+          { label: "Organic", attribute: "organic", operator: "present", value: null, unit: null, mandatory: false, userQuote: "ideally organic" },
+        ],
+      },
+      text,
+    );
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.requirements.constraints.map((c) => c.attribute)).toEqual(["cocoa_percent", "organic"]);
+    expect(out.requirements.constraints[1].mandatory).toBe(false);
+    expect(out.dropped.map((d) => d.what)).toEqual(["Weight", "Cocoa"]);
+  });
+
+  it("refuses non-shopping text and unclear products", () => {
+    expect(groundIntent({ ...base, isShoppingRequest: false }, "asdf qwer").ok).toBe(false);
+    expect(groundIntent({ ...base, productQuote: "headphones" }, text).ok).toBe(false);
+  });
+
+  it("test-store reader: laptop request, no invented budget", () => {
+    expect(req.budget).toMatchObject({ max: 900, currency: "USD" });
+    expect(req.constraints.map((c) => `${c.attribute} ${c.operator} ${c.value} ${c.unit ?? ""}`.trim())).toEqual([
+      "ram gte 16 GB",
+      "storage gte 1 TB",
+      "warranty gte 2 year",
+      "condition eq new",
+    ]);
+    expect(requirementsFor("Find me a laptop with 16GB RAM").budget).toBeNull();
+    expect(groundIntent(testIntent("asdf qwer zxcv"), "asdf qwer zxcv").ok).toBe(false);
   });
 });
 
-describe("canonical JSON", () => {
-  it("is independent of key order", () => {
-    expect(canonicalize({ b: 1, a: { d: 2, c: 3 } })).toBe(canonicalize({ a: { c: 3, d: 2 }, b: 1 }));
-  });
-});
+// ------------------------------------------------------------------ contract
 
 describe("contract versioning", () => {
   const v1 = createContract(req, REQUEST, now);
 
-  it("is sealed and immutable", () => {
+  it("is sealed, immutable and tamper-evident", () => {
     expect(verifyContractHash(v1)).toBe(true);
     expect(() => {
-      (v1.requirements as { maxTotal: number }).maxTotal = 5000;
+      (v1.requirements as { product: string }).product = "x";
     }).toThrow();
-  });
-
-  it("detects tampering with a sealed contract", () => {
-    const forged = { ...v1, requirements: { ...v1.requirements, maxTotal: 5000 } };
+    const forged = { ...v1, requirements: { ...v1.requirements, budget: { ...v1.requirements.budget!, max: 5000 } } };
     expect(verifyContractHash(forged)).toBe(false);
     expect(findValidApproval(forged, [approve(v1, "buyer", now)])).toBeNull();
   });
 
-  it("requires re-approval when a critical field changes", () => {
+  it("needs re-approval when the budget or a must-have changes, not for a preference", () => {
     const a1 = approve(v1, "buyer", now);
-    expect(findValidApproval(v1, [a1])).not.toBeNull();
-    const { contract: v2, criticalChanges } = reviseContract(v1, { maxTotal: 950 }, now);
-    expect(v2.version).toBe(2);
-    expect(v2.parentHash).toBe(v1.hash);
-    expect(criticalChanges).toEqual(["maxTotal"]);
-    expect(findValidApproval(v2, [a1])).toBeNull();
-  });
-
-  it("reports no critical change for preference edits", () => {
-    const { criticalChanges } = reviseContract(v1, { preferences: ["light weight"] }, now);
-    expect(criticalChanges).toEqual([]);
-  });
-});
-
-describe("fact grounding", () => {
-  it("drops facts whose quote is not in the source", () => {
-    const { facts, rejected } = groundFacts(
-      {
-        ramGb: { value: 16, quote: "16GB RAM" },
-        storageGb: null,
-        warrantyMonths: { value: 24, quote: "2-year warranty" },
-        condition: null,
-      },
-      "Laptop with 16GB RAM. 1-year limited warranty.",
+    const budget = reviseContract(v1, { ...req, budget: { ...req.budget!, max: 950, origin: "edited", userQuote: "" } }, now);
+    expect(budget.criticalChanges).toEqual(["budget"]);
+    expect(findValidApproval(budget.contract, [a1])).toBeNull();
+    const pref = reviseContract(
+      v1,
+      { ...req, constraints: [...req.constraints, { id: "c9", label: "Light", attribute: "weight", operator: "lte", value: "1.5", unit: "kg", mandatory: false, origin: "edited", userQuote: "" }] },
+      now,
     );
-    expect(facts.ramGb?.value).toBe(16);
-    expect(facts.warrantyMonths).toBeNull();
-    expect(rejected).toHaveLength(1);
+    expect(pref.criticalChanges).toEqual([]);
+  });
+
+  it("canonical JSON is key-order independent", () => {
+    expect(canonicalize({ b: 1, a: { d: 2, c: 3 } })).toBe(canonicalize({ a: { c: 3, d: 2 }, b: 1 }));
   });
 });
 
-describe("injection detection", () => {
-  it("catches the hidden instruction in L-103", () => {
-    const r = detectInjection(getListing("L-103")!.html);
-    expect(r.severity).toBe("high");
-    expect(r.findings.every((f) => f.location === "hidden")).toBe(true);
-    expect(r.findings.map((f) => f.rule)).toContain("budget-manipulation");
+// ------------------------------------------------------------------ units and comparison
+
+describe("units and comparison", () => {
+  it("converts and parses", () => {
+    expect(convert(1, "TB", "GB")).toBe(1000);
+    expect(convert(2, "years", "month")).toBeCloseTo(24);
+    expect(convert(1, "kg", "%")).toBeNull();
+    expect(parseNumber("70% cocoa")).toEqual({ value: 70, unit: "%" });
+    expect(parseNumber("two-year warranty")).toEqual({ value: 2, unit: "year" });
   });
 
-  it("keeps hidden text out of what the buyer sees", () => {
-    expect(visibleText(getListing("L-103")!.html)).not.toMatch(/ignore previous/i);
+  const c = (operator: "gte" | "lte" | "eq" | "excludes", value: string, unit: string | null = null) => ({
+    id: "c1", label: "x", attribute: "x", operator, value, unit, mandatory: true, origin: "request" as const, userQuote: "",
   });
+  const f = (value: string, unit: string | null = null) => ({ constraintId: "c1", value, unit, quote: value, source: "extracted" as const });
 
-  it("does not flag clean listings", () => {
-    expect(detectInjection(getListing("L-101")!.html).severity).toBe("none");
+  it("compares across units and wording", () => {
+    expect(compare(c("gte", "70", "%"), f("72", "%")).result).toBe("met");
+    expect(compare(c("gte", "70", "%"), f("45%")).result).toBe("not_met");
+    expect(compare(c("gte", "1", "TB"), f("512", "GB")).result).toBe("not_met");
+    expect(compare(c("gte", "24", "months"), f("2", "year")).result).toBe("met");
+    expect(compare(c("lte", "200", "g"), f("1", "kg")).result).toBe("not_met");
+    expect(compare(c("gte", "5", "kg"), f("5", "%")).result).toBe("unknown");
+    expect(compare(c("eq", "black"), f("Matte Black")).result).toBe("met");
+    expect(compare(c("excludes", "nuts"), f("nut-free")).result).toBe("met");
+    expect(compare(c("excludes", "nuts"), f("contains nuts")).result).toBe("not_met");
   });
 });
 
-function evalListing(id: string) {
-  const l = getListing(id)!;
-  const vis = visibleText(l.html);
-  const { facts } = groundFacts(extractFactsHeuristic(vis), vis);
-  return evaluate({
-    requirements: req,
-    facts,
-    listedPrice: l.listedPrice,
-    quote: l.checkout,
-    injection: detectInjection(l.html),
-  });
-}
+// ------------------------------------------------------------------ rule engine on the test store (regression)
 
-describe("rule engine on the marketplace", () => {
+describe("rule engine on the test store", () => {
+  // Item-price scope: fees, tax and subscriptions at checkout are not verified (by design).
   const expected: Record<string, { verdict: string; failing: string[] }> = {
     "L-101": { verdict: "PASS", failing: [] },
-    "L-102": { verdict: "BLOCK", failing: ["warranty", "condition"] },
-    "L-103": { verdict: "BLOCK", failing: ["injection", "budget"] },
-    "L-104": { verdict: "FLAG", failing: ["fees"] },
-    "L-105": { verdict: "BLOCK", failing: ["budget", "price-drift"] },
+    "L-102": { verdict: "BLOCK", failing: ["c3", "c4"] },
+    "L-103": { verdict: "BLOCK", failing: ["budget", "injection"] },
+    "L-104": { verdict: "PASS", failing: [] },
+    "L-105": { verdict: "FLAG", failing: ["price-drift"] },
     "L-106": { verdict: "PASS", failing: [] },
-    "L-107": { verdict: "FLAG", failing: ["warranty"] },
-    "L-108": { verdict: "BLOCK", failing: ["ram"] },
+    "L-107": { verdict: "FLAG", failing: ["c3"] },
+    "L-108": { verdict: "BLOCK", failing: ["c1"] },
     "L-109": { verdict: "BLOCK", failing: ["currency"] },
-    "L-110": { verdict: "FLAG", failing: ["recurring"] },
+    "L-110": { verdict: "PASS", failing: [] },
     "L-111": { verdict: "BLOCK", failing: ["budget"] },
-    "L-112": { verdict: "BLOCK", failing: ["storage"] },
+    "L-112": { verdict: "BLOCK", failing: ["c2"] },
   };
+  const store = searchTestStore(now);
 
   for (const [id, exp] of Object.entries(expected)) {
     it(`${id} → ${exp.verdict}`, () => {
-      const e = evalListing(id);
+      const { record, listedPrice } = store.find((x) => x.record.id === id)!;
+      const e = verifyRecord(req, record, listedPrice);
       expect(e.verdict).toBe(exp.verdict);
-      const failing = e.checks.filter((c) => c.status !== "pass").map((c) => c.id).sort();
-      expect(failing).toEqual([...exp.failing].sort());
+      expect(e.checks.filter((c) => c.status !== "pass").map((c) => c.id).sort()).toEqual([...exp.failing].sort());
     });
   }
 
-  it("flags missing facts instead of passing them", () => {
-    const l = getListing("L-101")!;
-    const e = evaluate({
-      requirements: req,
-      facts: { ramGb: null, storageGb: null, warrantyMonths: null, condition: null },
-      listedPrice: l.listedPrice,
-      quote: l.checkout,
-      injection: { severity: "none", findings: [] },
-    });
+  it("a missing fact is flagged, never passed", () => {
+    const p = { ...testStoreRecord("L-101", now)!, description: "A laptop." };
+    const e = verifyRecord(req, p);
     expect(e.verdict).toBe("FLAG");
   });
+
+  it("evidence is labelled synthetic and hashed", () => {
+    const s1 = snapshot(testStoreRecord("L-101", now)!);
+    expect(s1.synthetic?.kind).toBe("test-store");
+    expect(s1.hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("the test-store agent follows the planted instruction", () => {
+    expect(testChoose(req, store.map((x) => x.record)).chosenId).toBe("L-103");
+  });
 });
 
-describe("agents", () => {
-  it("the unprotected agent gets steered by the injected listing", () => {
-    const r = runUnprotectedAgent(req, LISTINGS)!;
-    expect(r.listing.id).toBe("L-103");
+// ------------------------------------------------------------------ Seller Mode
+
+describe("Seller Mode", () => {
+  const base = testStoreRecord("L-101", now)!;
+
+  it("hidden instructions are blocked", () => {
+    const p = applyAttack(base, "hidden_instruction", req);
+    expect(p.synthetic?.kind).toBe("seller-mode");
+    expect(verifyRecord(req, p).verdict).toBe("BLOCK");
+    expect(base.hiddenText).toEqual([]); // the original is untouched
   });
 
-  it("the protected agent recommends the cheapest PASS", () => {
-    const candidates = LISTINGS.map((l) => {
-      const vis = visibleText(l.html);
-      const { facts } = groundFacts(extractFactsHeuristic(vis), vis);
-      return { listing: l, facts, evaluation: evalListing(l.id) };
-    });
-    expect(pickProtected(candidates).recommended?.listing.id).toBe("L-101");
-  });
-
-  it("PACT flags the unprotected agent's false claims", () => {
-    // Without the injected listing, it falls back to the cheapest keyword match.
-    const r = runUnprotectedAgent(req, LISTINGS.filter((l) => l.id !== "L-103"))!;
-    expect(r.listing.id).toBe("L-112");
-    const vis = visibleText(r.listing.html);
-    const e = evaluate({
-      requirements: req,
-      facts: groundFacts(extractFactsHeuristic(vis), vis).facts,
-      listedPrice: r.listing.listedPrice,
-      quote: r.listing.checkout,
-      injection: detectInjection(r.listing.html),
-      agentClaim: r.claim,
-    });
+  it("fine print that contradicts a must-have is blocked", () => {
+    const e = verifyRecord(req, applyAttack(base, "spec_contradiction", req));
     expect(e.verdict).toBe("BLOCK");
-    expect(e.checks.find((c) => c.id === "agent-claim")?.status).toBe("flag");
+    expect(e.checks.find((c) => c.id === "c1")?.status).toBe("block");
+  });
+
+  it("price inflation is only visible at PayPal", () => {
+    const p = applyAttack(base, "price_inflation", req);
+    expect(verifyRecord(req, p).verdict).toBe("PASS");
+    expect(p.orderPriceOverride).toBeGreaterThan(p.offer.price);
   });
 });
+
+// ------------------------------------------------------------------ Channel3 normaliser
+
+describe("Channel3 normaliser (shape from the documented Product schema, not a recorded response)", () => {
+  it("picks the cheapest in-stock offer and keeps no offer URL", () => {
+    const rec = normalise(
+      {
+        id: "p1",
+        title: "Dark Chocolate 70%",
+        description: "Rich dark chocolate with 70% cocoa.",
+        brands: [{ id: "b", name: "Acme" }],
+        key_features: ["70% cocoa", "100 g bar"],
+        structured_attributes: { color: ["brown"], empty: [] },
+        offers: [
+          { url: "https://a.example/p", domain: "a.example", price: { price: 4.5, currency: "USD" }, availability: "InStock", condition: "new" },
+          { url: "https://b.example/p", domain: "b.example", price: { price: 3.9, currency: "USD" }, availability: "OutOfStock", condition: "new" },
+          { url: "https://c.example/p", domain: "c.example", price: { price: 4.1, currency: "usd" }, availability: "InStock", condition: "new" },
+        ],
+      },
+      now,
+    )!;
+    expect(rec.offer).toEqual({ domain: "c.example", price: 4.1, currency: "USD", availability: "InStock", condition: "new" });
+    expect(rec.attributes).toEqual({ color: ["brown"] });
+    expect(JSON.stringify(rec)).not.toContain("https://");
+    expect(normalise({ id: "x", title: "No offers", offers: [] })).toBeNull();
+  });
+});
+
+// ------------------------------------------------------------------ evidence chain and signed receipts
 
 describe("evidence chain", () => {
   const build = () => {
     let chain: EvidenceEvent[] = [];
     chain = appendEvent(chain, { type: "REQUEST_RECEIVED", actor: "buyer", summary: "req", data: { REQUEST }, sources: [] }, now);
     chain = appendEvent(chain, { type: "CONTRACT_APPROVED", actor: "buyer", summary: "ok", data: { v: 1 }, sources: [] }, now);
-    chain = appendEvent(chain, { type: "PAYPAL_CAPTURED", actor: "paypal", summary: "paid", data: { id: "X" }, sources: [] }, now);
+    chain = appendEvent(chain, { type: "PAYPAL_CAPTURED", actor: "paypal", summary: "paid", data: { amount: "872.24" }, sources: [] }, now);
     return chain;
   };
 
-  it("verifies an untouched chain", () => {
+  it("verifies an untouched chain and catches edits and removals", () => {
     expect(verifyChain(build()).valid).toBe(true);
+    const edited = build();
+    edited[1] = { ...edited[1], data: { v: 2 } };
+    expect(verifyChain(edited)).toMatchObject({ valid: false, brokenAt: 1 });
+    const removed = build();
+    removed.splice(1, 1);
+    expect(verifyChain(removed).valid).toBe(false);
   });
 
-  it("detects an edited event", () => {
-    const chain = build();
-    chain[1] = { ...chain[1], data: { v: 2 } };
-    const v = verifyChain(chain);
-    expect(v.valid).toBe(false);
-    expect(v.brokenAt).toBe(1);
-  });
-
-  it("detects a removed event", () => {
-    const chain = build();
-    chain.splice(1, 1);
-    expect(verifyChain(chain).valid).toBe(false);
-  });
-});
-
-describe("signed receipts", () => {
-  const secret = "test-secret";
-  const chain = () => {
-    let c: EvidenceEvent[] = [];
-    c = appendEvent(c, { type: "REQUEST_RECEIVED", actor: "buyer", summary: "req", data: {}, sources: [] }, now);
-    c = appendEvent(c, { type: "PAYPAL_CAPTURED", actor: "paypal", summary: "paid", data: { amount: "872.24" }, sources: [] }, now);
-    return c;
-  };
-
-  it("accepts an untouched receipt", () => {
-    const c = chain();
-    expect(verifyReceipt(secret, "s1", c, signReceipt(secret, "s1", c)).valid).toBe(true);
-  });
-
-  it("rejects a forgery that recomputes every hash", () => {
-    const c = chain();
+  it("a forgery that recomputes every hash fails the server signature", () => {
+    const secret = "test-secret";
+    const c = build();
     const sig = signReceipt(secret, "s1", c);
+    expect(verifyReceipt(secret, "s1", c, sig).valid).toBe(true);
     const forged = structuredClone(c);
-    (forged[1].data as { amount: string }).amount = "1.00";
+    (forged[2].data as { amount: string }).amount = "1.00";
     let prev = GENESIS;
     for (const e of forged) {
       e.prevHash = prev;
@@ -247,16 +294,8 @@ describe("signed receipts", () => {
       e.hash = eventHash(body);
       prev = e.hash;
     }
-    expect(verifyChain(forged).valid).toBe(true); // the hash chain alone is fooled
-    const r = verifyReceipt(secret, "s1", forged, sig);
-    expect(r.valid).toBe(false);
-    expect(r.signatureValid).toBe(false);
-  });
-
-  it("rejects a receipt moved to another session or signed with another key", () => {
-    const c = chain();
-    expect(verifyReceipt(secret, "s2", c, signReceipt(secret, "s1", c)).valid).toBe(false);
-    expect(verifyReceipt(secret, "s1", c, signReceipt("other", "s1", c)).valid).toBe(false);
-    expect(verifyReceipt(secret, "s1", c, "not-a-signature").valid).toBe(false);
+    expect(verifyChain(forged).valid).toBe(true);
+    expect(verifyReceipt(secret, "s1", forged, sig)).toMatchObject({ valid: false, signatureValid: false });
+    expect(verifyReceipt(secret, "s2", c, sig).valid).toBe(false);
   });
 });

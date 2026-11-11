@@ -14,7 +14,11 @@ export function Evidence({ session, control }: { session: SessionView; control: 
 
   const download = () => {
     const pkg = {
-      format: "pact-evidence/v1",
+      format: "pact-evidence/v2",
+      // TEST receipts come from the test store or Seller Mode: fictional or deliberately altered products.
+      test: session.isTest,
+      mode: session.mode,
+      sellerAttack: session.sellerAttack,
       generatedAt: new Date().toISOString(),
       sessionId: session.id,
       requestText: session.requestText,
@@ -35,7 +39,7 @@ export function Evidence({ session, control }: { session: SessionView; control: 
     const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `pact-evidence-${session.id.slice(0, 8)}.json`;
+    a.download = `pact-evidence-${session.isTest ? "TEST-" : ""}${session.id.slice(0, 8)}.json`;
     a.click();
     URL.revokeObjectURL(a.href);
   };
@@ -87,6 +91,13 @@ export function Evidence({ session, control }: { session: SessionView; control: 
         )
       }
     >
+      {session.isTest && (
+        <p className="border-b border-flag-line bg-flag-soft px-5 py-2 text-sm font-medium text-flag sm:px-6">
+          TEST receipt. This session used{" "}
+          {session.sellerAttack ? "Seller Mode, which deliberately alters a product" : "the test store's fictional products"}. It
+          is not evidence about a real product or seller.
+        </p>
+      )}
       <div className="grid gap-8 p-5 sm:p-6 lg:grid-cols-[minmax(0,1fr)_16rem]">
         {/* Timeline */}
         <table className="w-full border-collapse text-left text-sm">
