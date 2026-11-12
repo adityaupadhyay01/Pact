@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { body, handle } from "@/lib/http";
+import { body, handle, orderId, productId, sessionId } from "@/lib/http";
 import {
   approveContract,
   approvePurchase,
@@ -16,15 +16,21 @@ import {
 
 export const maxDuration = 60;
 
+const ACTIONS = new Set(["approve", "revise", "discover", "select", "verify", "purchase", "order", "sim-approve", "cancel", "capture"]);
+
 export async function POST(req: NextRequest, ctx: RouteContext<"/api/session/[id]/[action]">) {
-  const { id, action } = await ctx.params;
+  const { id: rawId, action } = await ctx.params;
   return handle(async () => {
+    if (!ACTIONS.has(action)) throw new PactError(404, "Unknown action", "NOT_FOUND");
+    const id = sessionId(rawId);
     const b = await body<Record<string, unknown>>(req);
     switch (action) {
       case "approve":
         return approveContract(id, String(b.contractHash ?? ""));
-      case "revise":
-        return revise(id, (b.patch ?? {}) as Parameters<typeof revise>[1]);
+      case "revise": {
+        const patch = b.patch && typeof b.patch === "object" ? (b.patch as Parameters<typeof revise>[1]) : {};
+        return revise(id, patch);
+      }
       // The check runs as three steps so the UI can show progress and retry one step.
       case "discover":
         return discover(id);
@@ -32,22 +38,23 @@ export async function POST(req: NextRequest, ctx: RouteContext<"/api/session/[id
         return select(id);
       case "verify":
         return verify(id);
-      case "purchase":
-        return approvePurchase(
-          id,
-          String(b.productId ?? b.listingId ?? ""),
-          Array.isArray(b.acknowledgedFlags) ? b.acknowledgedFlags.map(String) : [],
-        );
+      case "purchase": {
+        // The price the buyer saw is only compared with the fresh price; it's never used as the price.
+        const expectedPrice = typeof b.expectedPrice === "number" && Number.isFinite(b.expectedPrice) ? b.expectedPrice : undefined;
+        const expectedCurrency = typeof b.expectedCurrency === "string" ? b.expectedCurrency.slice(0, 3).toUpperCase() : undefined;
+        const acks = Array.isArray(b.acknowledgedFlags) ? b.acknowledgedFlags.slice(0, 50).map((x) => String(x).slice(0, 40)) : [];
+        return approvePurchase(id, productId(b.productId ?? b.listingId), acks, { price: expectedPrice, currency: expectedCurrency });
+      }
       case "order":
         return createPaypalOrder(id);
       case "sim-approve":
-        return simulateApproval(id, String(b.orderId ?? ""), { decline: b.decline === true });
+        return simulateApproval(id, orderId(b.orderId), { decline: b.decline === true });
       case "cancel":
-        return cancelPayment(id, String(b.orderId ?? ""));
+        return cancelPayment(id, orderId(b.orderId));
       case "capture":
-        return capture(id, String(b.orderId ?? ""));
+        return capture(id, orderId(b.orderId));
       default:
-        throw new PactError(404, "Unknown action");
+        throw new PactError(404, "Unknown action", "NOT_FOUND");
     }
   });
 }

@@ -7,7 +7,8 @@ import { describeRequirement } from "@/lib/rules";
 import { Button, Details, Step, type StepControl, money, shortHash } from "./ui";
 import type { SessionView } from "./api";
 
-const CURRENCIES = ["USD", "EUR", "GBP", "CAD", "AUD", "CHF", "SEK", "PLN", "CZK", "RON"];
+// US merchants and PayPal Sandbox in US dollars only in this version.
+const CURRENCIES = ["USD"];
 
 export function ContractCard({
   control,

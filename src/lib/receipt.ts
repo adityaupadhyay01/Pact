@@ -1,6 +1,7 @@
 import "server-only";
 import { randomBytes } from "node:crypto";
 import { signReceipt, verifyReceipt, type EvidenceEvent } from "./evidence";
+import { ConfigError, isProduction } from "./env";
 
 /**
  * Receipt signing key. Set EVIDENCE_SECRET in any hosted deployment: without it
@@ -10,6 +11,8 @@ import { signReceipt, verifyReceipt, type EvidenceEvent } from "./evidence";
 const g = globalThis as unknown as { __pactEphemeralSecret?: string };
 function secret(): string {
   if (process.env.EVIDENCE_SECRET) return process.env.EVIDENCE_SECRET;
+  // A per-process key would make hosted receipts unverifiable after a restart: refuse instead.
+  if (isProduction()) throw new ConfigError("EVIDENCE_SECRET is required in production, so receipts stay verifiable.");
   g.__pactEphemeralSecret ??= randomBytes(32).toString("hex");
   return g.__pactEphemeralSecret;
 }

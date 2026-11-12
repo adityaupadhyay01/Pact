@@ -22,12 +22,22 @@ export interface Check {
   actual?: string;
   /** The listing text this check relied on. */
   evidence?: string;
+  /**
+   * For requirement checks: what PACT knows about the evidence.
+   * verified = stated and compliant; violated = stated and not compliant;
+   * missing = not stated; unknown = stated but not comparable; conflicting = sources disagree.
+   */
+  state?: EvidenceState;
 }
+
+export type EvidenceState = "verified" | "violated" | "missing" | "unknown" | "conflicting";
 
 export interface EvaluationInput {
   requirements: Requirements;
   product: ProductRecord;
   facts: Facts;
+  /** Requirements where two evidence sources disagree (e.g. a catalog field vs the description). */
+  conflicts?: Record<string, Fact[]>;
   injection: InjectionReport;
   /** Item price when the product was found; a higher price now is a change since search. */
   searchedPrice?: number;
@@ -67,97 +77,188 @@ export function describeRequirement(c: Constraint): string {
 }
 
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9%.]+/g, " ").trim();
-const YES = /^(yes|true|included|present|available)$/i;
-const NO = /^(no|false|not included|none|unavailable)$/i;
+const YES = /^(yes|true|included|present|available|with)$/i;
+const NO = /^(no|false|not included|none|unavailable|without|n\/a)$/i;
 const NEGATION = /\b(free|no|without|does not contain|doesn't contain|non)\b/i;
+/** A fact that says the feature is absent ("No", "Not included", "without ANC"). */
+const ABSENT = /^(no|none|false|not included|not available|unavailable|without|n\/a)\b|\b(not included|not available|does not have|doesn't have|without)\b/i;
+
+/** Words in a text, each normalised as a unit ("cups", "gb", …). */
+const wordsOf = (t: string) =>
+  t
+    .toLowerCase()
+    .replace(/(\d)([a-z])/g, "$1 $2")
+    .split(/[^a-z"%]+/)
+    .filter(Boolean)
+    .map((w) => normalizeUnit(w));
+
+/** The number and unit a fact states. Falls back to the quote for the unit when the value has none. */
+function factNumber(f: Fact): { value: number; unit: string | null } | null {
+  const fromValue = parseNumber(f.unit ? `${f.value ?? ""} ${f.unit}` : (f.value ?? ""));
+  if (fromValue && (fromValue.unit || f.unit)) return { value: fromValue.value, unit: normalizeUnit(f.unit) ?? fromValue.unit };
+  // "16" with the quote "16GB RAM": take the unit from the quote when the number matches.
+  const fromQuote = parseNumber(f.quote);
+  if (fromValue && fromQuote && Math.abs(fromQuote.value - fromValue.value) < 1e-9) return fromQuote;
+  return fromValue ?? (f.value === null ? fromQuote : null);
+}
+
+/**
+ * Bring a stated number into the requirement's unit. Returns a reason instead
+ * when that can't be done honestly: different dimensions (1 kg vs 1%), an
+ * unknown unit, or a unit on only one side. Raw numbers are never compared across units.
+ */
+function inRequirementUnit(c: Constraint, got: { value: number; unit: string | null }, factText = ""): { value: number } | { why: string } {
+  const reqUnit = normalizeUnit(c.unit);
+  // A unit PACT has no table entry for ("cups") still counts when the fact spells the same word.
+  const gotUnit = got.unit ?? (reqUnit && wordsOf(factText).includes(reqUnit) ? reqUnit : null);
+  if (!reqUnit && !gotUnit) return { value: got.value };
+  if (!reqUnit || !gotUnit) return { why: `one side has no unit (${reqUnit ?? "none"} vs ${gotUnit ?? "none"})` };
+  if (reqUnit === gotUnit) return { value: got.value };
+  const converted = convert(got.value, gotUnit, reqUnit);
+  return converted === null ? { why: `can't compare ${gotUnit} with ${reqUnit}` } : { value: converted };
+}
 
 /**
  * Compare one requirement with one fact.
- * "unknown" means the fact can't be compared (units don't match, no number).
+ * "unknown" means the fact can't be compared reliably (no number, incompatible
+ * or missing units, unsupported comparison). Unknown never counts as met.
  */
 export function compare(c: Constraint, f: Fact): { result: "met" | "not_met" | "unknown"; note?: string } {
-  const factText = f.value ?? f.quote;
+  const factText = (f.value ?? f.quote).trim();
   switch (c.operator) {
     case "present":
-      return { result: "met" };
+      return ABSENT.test(factText) ? { result: "not_met" } : { result: "met" };
     case "gte":
     case "lte": {
-      const req = parseNumber(`${c.value ?? ""} ${c.unit ?? ""}`);
-      const got = parseNumber(f.unit ? `${f.value ?? ""} ${f.unit}` : factText);
-      if (!req || !got) return { result: "unknown", note: "no number to compare" };
-      const reqUnit = normalizeUnit(c.unit) ?? req.unit;
-      const gotUnit = normalizeUnit(f.unit) ?? got.unit;
-      let value = got.value;
-      let note: string | undefined;
-      if (reqUnit && gotUnit && reqUnit !== gotUnit) {
-        const converted = convert(got.value, gotUnit, reqUnit);
-        if (converted === null) return { result: "unknown", note: `can't compare ${gotUnit} with ${reqUnit}` };
-        value = converted;
-      } else if (!reqUnit !== !gotUnit) {
-        note = "assumed the same unit";
-      }
-      const ok = c.operator === "gte" ? value >= req.value - 1e-9 : value <= req.value + 1e-9;
-      return { result: ok ? "met" : "not_met", note };
+      const want = Number(c.value);
+      if (c.value === null || c.value.trim() === "" || !Number.isFinite(want)) return { result: "unknown", note: "the requirement has no number" };
+      const got = factNumber(f);
+      if (!got) return { result: "unknown", note: "the listing gives no number" };
+      const v = inRequirementUnit(c, got, `${f.value ?? ""} ${f.unit ?? ""}`);
+      if ("why" in v) return { result: "unknown", note: v.why };
+      const ok = c.operator === "gte" ? v.value >= want - 1e-9 : v.value <= want + 1e-9;
+      return { result: ok ? "met" : "not_met" };
     }
     case "eq": {
       const want = (c.value ?? "").trim();
+      if (!want) return { result: "unknown", note: "the requirement has no value" };
       if (YES.test(want) || NO.test(want)) {
-        const has = !NO.test(factText.trim()) && !/\bnot\b/i.test(factText);
+        const has = !ABSENT.test(factText);
         return { result: (YES.test(want) ? has : !has) ? "met" : "not_met" };
       }
-      const a = parseNumber(`${want} ${c.unit ?? ""}`);
-      const b = parseNumber(f.unit ? `${f.value ?? ""} ${f.unit}` : factText);
-      if (a && b && /\d/.test(want)) {
-        const conv = convert(b.value, normalizeUnit(f.unit) ?? b.unit, normalizeUnit(c.unit) ?? a.unit);
-        const v = conv ?? b.value;
-        return { result: Math.abs(v - a.value) < 1e-6 ? "met" : "not_met" };
+      if (/\d/.test(want) && Number.isFinite(Number(want))) {
+        const got = factNumber(f);
+        if (!got) return { result: "unknown", note: "the listing gives no number" };
+        const v = inRequirementUnit(c, got, `${f.value ?? ""} ${f.unit ?? ""}`);
+        if ("why" in v) return { result: "unknown", note: v.why };
+        return { result: Math.abs(v.value - Number(want)) < 1e-6 ? "met" : "not_met" };
       }
       const w = norm(want);
       const t = norm(factText);
       return { result: t === w || ` ${t} `.includes(` ${w} `) ? "met" : "not_met" };
     }
-    case "contains":
-      return { result: norm(factText).includes(norm(c.value ?? "")) ? "met" : "not_met" };
+    case "contains": {
+      const w = norm(c.value ?? "");
+      if (!w) return { result: "unknown", note: "the requirement has no value" };
+      return { result: norm(factText).includes(w) ? "met" : "not_met" };
+    }
     case "excludes": {
       const t = norm(factText);
       const w = norm(c.value ?? "");
+      if (!w) return { result: "unknown", note: "the requirement has no value" };
       if (!t.includes(w)) return { result: "met" };
       return { result: NEGATION.test(factText) ? "met" : "not_met" };
     }
+    default:
+      return { result: "unknown", note: "unsupported comparison" };
   }
 }
 
-function requirementCheck(c: Constraint, f: Fact | null): Check {
+/**
+ * Combine catalog-field facts and facts read from the listing text. When both
+ * sources state a requirement and disagree on whether it's met, that's a
+ * conflict, kept with both quotes.
+ */
+export function resolveFacts(
+  constraints: Constraint[],
+  fromCatalog: Facts,
+  fromText: Facts,
+): { facts: Facts; conflicts: Record<string, Fact[]> } {
+  const facts: Facts = {};
+  const conflicts: Record<string, Fact[]> = {};
+  for (const c of constraints) {
+    const a = fromCatalog[c.id] ?? null;
+    const b = fromText[c.id] ?? null;
+    if (a && b) {
+      const ra = compare(c, a).result;
+      const rb = compare(c, b).result;
+      if (ra !== rb && ra !== "unknown" && rb !== "unknown") conflicts[c.id] = [a, b];
+      // Cautious merge: a source that can't be confirmed (unknown) or that fails always outranks one that passes.
+      const rank = { not_met: 0, unknown: 1, met: 2 } as const;
+      facts[c.id] = rank[rb] < rank[ra] ? b : a;
+    } else {
+      facts[c.id] = a ?? b;
+    }
+  }
+  return { facts, conflicts };
+}
+
+const sourceName = (f: Fact) => (f.source === "catalog_field" ? "catalog field" : "listing text");
+const factLabel = (f: Fact) =>
+  [f.value, f.unit && !(f.value ?? "").toLowerCase().includes(f.unit.toLowerCase()) ? f.unit : null].filter(Boolean).join(" ") ||
+  "Stated";
+
+function requirementCheck(c: Constraint, f: Fact | null, conflict: Fact[] | undefined): Check {
   const expected = describeRequirement(c);
   const kind = c.mandatory ? "" : " (nice to have)";
+  const label = `${c.label}${kind}`;
+
+  if (conflict && conflict.length > 1) {
+    const anyViolates = conflict.some((x) => compare(c, x).result === "not_met");
+    const said = conflict.map((x) => `the ${sourceName(x)} says ${factLabel(x)}`).join(", but ");
+    return {
+      id: c.id,
+      label,
+      // The seller's own data says a must-have is broken: block. Otherwise it needs a human look.
+      status: c.mandatory && anyViolates ? "block" : "flag",
+      state: "conflicting",
+      detail: `The listing contradicts itself: ${said}. PACT can't confirm this requirement is met.`,
+      expected,
+      actual: conflict.map(factLabel).join(" vs "),
+      evidence: conflict.map((x) => x.quote).join(" | "),
+    };
+  }
+
   if (!f) {
     return c.mandatory
       ? {
           id: c.id,
           label: c.label,
           status: "flag",
+          state: "missing",
           detail: "The listing doesn't say. PACT won't guess, so you decide whether that's OK.",
           expected,
           actual: "Not stated",
         }
       : {
           id: c.id,
-          label: `${c.label}${kind}`,
+          label,
           status: "pass",
+          state: "missing",
           detail: "Not stated in the listing. It's a nice-to-have, so it doesn't affect the verdict.",
           expected,
           actual: "Not stated",
         };
   }
   const { result, note } = compare(c, f);
-  const actual = [f.value, f.unit && !(f.value ?? "").includes(f.unit) ? f.unit : null].filter(Boolean).join(" ") || "Stated";
-  const source = f.source === "catalog_field" ? "catalog field" : "listing text";
+  const actual = factLabel(f);
   if (result === "met") {
     return {
       id: c.id,
-      label: `${c.label}${kind}`,
+      label,
       status: "pass",
-      detail: `Matches what you asked for (from the ${source}${note ? `; ${note}` : ""}).`,
+      state: "verified",
+      detail: `Matches what you asked for (from the ${sourceName(f)}).`,
       expected,
       actual,
       evidence: f.quote,
@@ -166,8 +267,9 @@ function requirementCheck(c: Constraint, f: Fact | null): Check {
   if (result === "unknown") {
     return {
       id: c.id,
-      label: `${c.label}${kind}`,
+      label,
       status: "flag",
+      state: "unknown",
       detail: `The listing mentions it, but PACT can't compare it reliably (${note}).`,
       expected,
       actual,
@@ -176,8 +278,9 @@ function requirementCheck(c: Constraint, f: Fact | null): Check {
   }
   return {
     id: c.id,
-    label: `${c.label}${kind}`,
+    label,
     status: c.mandatory ? "block" : "flag",
+    state: "violated",
     detail: c.mandatory
       ? `The listing says ${actual}, which doesn't meet your requirement.`
       : `The listing says ${actual}. It's only a nice-to-have, so it needs your OK rather than blocking.`,
@@ -188,7 +291,7 @@ function requirementCheck(c: Constraint, f: Fact | null): Check {
 }
 
 export function evaluate(input: EvaluationInput): Evaluation {
-  const { requirements: req, product, facts, injection, searchedPrice, agentClaims, agentSummary } = input;
+  const { requirements: req, product, facts, conflicts = {}, injection, searchedPrice, agentClaims, agentSummary } = input;
   const checks: Check[] = [];
   const offer = product.offer;
 
@@ -266,7 +369,7 @@ export function evaluate(input: EvaluationInput): Evaluation {
   }
 
   // 5. Each requirement.
-  for (const c of req.constraints) checks.push(requirementCheck(c, facts[c.id] ?? null));
+  for (const c of req.constraints) checks.push(requirementCheck(c, facts[c.id] ?? null, conflicts[c.id]));
 
   // 6. Did the agent describe the product truthfully?
   if (agentClaims) {

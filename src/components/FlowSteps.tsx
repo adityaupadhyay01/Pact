@@ -39,16 +39,26 @@ export function DiscoveryStep({
       title="Product discovery"
       subtitle={
         agent
-          ? `Your shopping agent looked at ${candidateCount} products from ${where} and picked one. It hasn't bought anything.`
+          ? `Your Shopping Agent looked at ${candidateCount} products from ${where} and picked one. It hasn't bought anything.`
           : `PACT searched ${where} for “${d?.query ?? session.contract.requirements.searchQuery}”.`
       }
     >
       <div className="p-5 sm:p-6">
+        {d && (
+          <p className="mb-4 text-xs text-muted">
+            <span className={d.provider === "test-store" ? "eyebrow mr-1.5 text-flag" : "eyebrow mr-1.5 text-ink-2"}>
+              {d.provider === "test-store" ? "Test data" : "Live catalog data"}
+            </span>
+            {d.provider === "test-store"
+              ? "Fictional products from PACT's test store."
+              : `Channel3 search at ${new Date(d.retrievedAt).toLocaleTimeString()}, US merchants, USD. Prices here are from the search; PACT re-fetches the product before checking it and again before you approve.`}
+          </p>
+        )}
         {agent ? (
           <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
             <section aria-labelledby="picked-title">
               <h3 id="picked-title" className="eyebrow text-muted">
-                The agent picked
+                The Shopping Agent picked
               </h3>
               <p className="mt-2 text-xl font-semibold tracking-[-0.01em] text-ink">{agent.record.title}</p>
               <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-muted">
@@ -94,7 +104,7 @@ export function DiscoveryStep({
 }
 
 /* ------------------------------------------------------------------ */
-/* Step 3: PACT verification                                          */
+/* Step 3: PACT Inspector                                             */
 /* ------------------------------------------------------------------ */
 
 export function VerificationStep({
@@ -110,7 +120,7 @@ export function VerificationStep({
   const r = session.contract.requirements;
   if (!subject) {
     return (
-      <Step control={control} title="PACT verification" subtitle="There was no product to verify.">
+      <Step control={control} title="PACT Inspector" subtitle="There was no product to verify.">
         <p className="p-5 text-sm text-ink-2 sm:p-6">The search found nothing, so there is nothing to compare.</p>
       </Step>
     );
@@ -183,7 +193,7 @@ export function VerificationStep({
   return (
     <Step
       control={control}
-      title="PACT verification"
+      title="PACT Inspector"
       subtitle={`PACT lines up four things for ${record.title}: your request, the seller's listing, what the agent told you and what you'd pay.`}
     >
       <div className="p-5 sm:p-6">

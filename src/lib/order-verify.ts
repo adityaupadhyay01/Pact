@@ -16,6 +16,8 @@ export interface PurchaseSnapshot {
   readonly acknowledgedFlags: string[];
   readonly evidenceHash?: string;
   readonly seller?: string;
+  /** When the evidence behind this approval was retrieved. */
+  readonly retrievedAt?: string;
   readonly approvedAt: string;
   readonly hash: string;
 }
@@ -26,7 +28,7 @@ export function createSnapshot(
   quote: CheckoutQuote,
   acknowledgedFlags: string[],
   now: Date = new Date(),
-  binding: { evidenceHash?: string; seller?: string } = {},
+  binding: { evidenceHash?: string; seller?: string; retrievedAt?: string } = {},
 ): PurchaseSnapshot {
   const body = {
     contractHash: contract.hash,
@@ -38,6 +40,12 @@ export function createSnapshot(
     approvedAt: now.toISOString(),
   };
   return deepFreeze({ ...body, hash: hashObject(body) });
+}
+
+/** True when the snapshot's hash still matches its contents (it wasn't altered after approval). */
+export function verifySnapshot(s: PurchaseSnapshot): boolean {
+  const { hash, ...body } = s;
+  return hashObject(body) === hash;
 }
 
 /** A PayPal order, normalised from the Orders v2 API response. */

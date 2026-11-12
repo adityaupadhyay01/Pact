@@ -10,7 +10,8 @@ const MAX_EVENTS = 500;
  */
 export async function POST(req: Request) {
   return handle(async () => {
-    const b = await body<{ sessionId?: string; events?: EvidenceEvent[]; receipt?: { signature?: string }; signature?: string }>(req);
+    // Receipts are larger than other requests, but still bounded.
+    const b = await body<{ sessionId?: string; events?: EvidenceEvent[]; receipt?: { signature?: string }; signature?: string }>(req, 2 * 1024 * 1024);
     if (!Array.isArray(b.events) || typeof b.sessionId !== "string") {
       throw new PactError(400, "Expected { sessionId, events, receipt: { signature } }");
     }

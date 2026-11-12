@@ -92,7 +92,9 @@ async function generateJson<T extends z.ZodTypeAny>(
     } catch (err) {
       lastInvalid = err;
     }
-    console.warn(`[ai] ${task}: invalid output (attempt ${attempt + 1})`, lastInvalid);
+    // Log where the output was wrong, never the content (it can echo the buyer's request).
+    const where = Array.isArray(lastInvalid) ? (lastInvalid as { path: PropertyKey[] }[]).map((i) => i.path.join(".")).join(", ") : "not JSON";
+    console.warn(`[ai] ${task}: invalid output (attempt ${attempt + 1}): ${where}`);
   }
   throw new AiError("invalid_output", "Gemini's answer didn't match the expected format.");
 }
@@ -111,7 +113,8 @@ const INTENT_SYSTEM = `You read a shopper's request and extract a purchase speci
   unit: e.g. %, GB, months, g, inch; null if none.
   mandatory: true unless the shopper marks it optional ("preferably", "ideally", "if possible", "nice to have").
   userQuote: the exact words from the request.
-- Never add a requirement the shopper didn't state. Copy every quote exactly as written.`;
+- clarificationQuestion: if the request doesn't name a product clearly enough to search for (e.g. "something nice", "a gift"), set product to null and ask ONE short question; otherwise null.
+- Never add a requirement, unit or currency the shopper didn't state. Copy every quote exactly as written.`;
 
 export function geminiIntent(text: string): Promise<RawIntent> {
   return generateJson("intent", INTENT_SYSTEM, `<request>\n${text}\n</request>`, RawIntentSchema);

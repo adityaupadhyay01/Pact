@@ -1,12 +1,12 @@
+import { inspect } from "../inspector";
 import { describe, expect, it } from "vitest";
 import { canonicalize } from "../canonical";
 import { approve, createContract, findValidApproval, reviseContract, verifyContractHash, type Requirements } from "../contract";
 import { appendEvent, eventHash, GENESIS, signReceipt, verifyChain, verifyReceipt, type EvidenceEvent } from "../evidence";
-import { catalogFacts, groundFacts, snapshot } from "../facts";
+import { snapshot } from "../facts";
 import { testChoose, testExtract, testIntent } from "../heuristics";
-import { detectInjectionInText } from "../injection";
 import { groundIntent, type RawIntent } from "../intent";
-import { compare, evaluate } from "../rules";
+import { compare } from "../rules";
 import { convert, parseNumber } from "../units";
 import { searchTestStore, testStoreRecord } from "../catalog/testStore";
 import { normalise } from "../catalog/channel3-normalise";
@@ -23,16 +23,9 @@ function requirementsFor(text: string): Requirements {
 }
 const req = requirementsFor(REQUEST);
 
-/** The same pipeline PACT runs in test mode: evidence → facts → injection → rules. */
+/** The real Inspector, with the test-store reader as the extractor (what PACT runs in test mode). */
 function verifyRecord(r: Requirements, p: ProductRecord, searchedPrice = p.offer.price) {
-  const ev = snapshot(p);
-  const fromCatalog = catalogFacts(r.constraints, p);
-  const toRead = r.constraints.filter((c) => !fromCatalog[c.id]);
-  const g = groundFacts(testExtract(toRead, p), toRead, ev.text);
-  const facts = { ...g.facts, ...fromCatalog };
-  const visible = [p.title, p.description ?? "", ...p.keyFeatures].join("\n");
-  const injection = detectInjectionInText(visible, p.hiddenText, g.instruction);
-  return evaluate({ requirements: r, product: p, facts, injection, searchedPrice });
+  return inspect({ requirements: r, record: p, extraction: testExtract(r.constraints, p), searchedPrice }).evaluation;
 }
 
 // ------------------------------------------------------------------ intent grounding
@@ -45,6 +38,7 @@ describe("intent grounding: nothing is invented", () => {
     searchQuery: "70% dark chocolate bar",
     budget: null,
     constraints: [],
+    clarificationQuestion: null,
   };
   const text = "I want a 70% dark chocolate bar under $5, ideally organic";
 

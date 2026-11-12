@@ -24,52 +24,75 @@ export interface C3Product {
 }
 
 
-/** Choose the offer PACT will verify: the cheapest in-stock offer, else the first one. */
-function pickOffer(offers: C3Offer[]): C3Offer | null {
-  const priced = offers.filter((o) => typeof o.price?.price === "number" && o.price.currency);
-  const inStock = priced.filter((o) => o.availability === "InStock");
-  const pool = inStock.length ? inStock : priced;
-  return pool.sort((a, b) => (a.price!.price! - b.price!.price!))[0] ?? null;
+const str = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : null);
+const strings = (v: unknown): string[] => (Array.isArray(v) ? v.map(str).filter((x): x is string => x !== null) : []);
+
+/** The merchant's host name, only if Channel3 gave one. PACT never invents a seller. */
+function hostOf(o: C3Offer): string | null {
+  const d = str(o.domain);
+  if (d) return d.toLowerCase();
+  try {
+    return o.url ? new URL(o.url).hostname.toLowerCase() : null;
+  } catch {
+    return null;
+  }
 }
 
-const hostOf = (o: C3Offer) => {
-  if (o.domain) return o.domain;
-  try {
-    return o.url ? new URL(o.url).hostname : "unknown seller";
-  } catch {
-    return "unknown seller";
-  }
-};
+/** Offers PACT can verify: a positive price, a currency and a known merchant. */
+function usable(o: C3Offer): boolean {
+  const price = o?.price?.price;
+  return typeof price === "number" && Number.isFinite(price) && price > 0 && Boolean(str(o.price?.currency)) && hostOf(o) !== null;
+}
 
+/** Choose the offer PACT will verify: the cheapest usable in-stock offer, else the cheapest usable one. */
+function pickOffer(offers: C3Offer[]): C3Offer | null {
+  const priced = offers.filter((o) => o && typeof o === "object" && usable(o));
+  const inStock = priced.filter((o) => o.availability === "InStock");
+  const pool = inStock.length ? inStock : priced;
+  return [...pool].sort((a, b) => a.price!.price! - b.price!.price!)[0] ?? null;
+}
+
+/**
+ * Normalise one Channel3 product. Returns null when the product can't be
+ * verified honestly (no id, no title, or no offer with a price, currency and
+ * merchant). Missing optional fields stay empty: nothing is filled in.
+ */
 export function normalise(p: C3Product, now = new Date()): ProductRecord | null {
-  const offer = pickOffer(p.offers ?? []);
-  if (!offer || !p.id || !p.title) return null;
+  if (!p || typeof p !== "object") return null;
+  const id = str(p.id);
+  const title = str(p.title);
+  const offer = pickOffer(Array.isArray(p.offers) ? p.offers : []);
+  if (!id || !title || !offer) return null;
   const availability = offer.availability === "InStock" || offer.availability === "OutOfStock" ? offer.availability : "Unknown";
-  const image = (p.images ?? []).find((i) => i.is_main_image) ?? (p.images ?? [])[0];
-  const category = p.category?.path?.length
-    ? p.category.path.map((x) => x.title).filter(Boolean).join(" › ")
-    : (p.category?.title ?? null);
+  const images = Array.isArray(p.images) ? p.images : [];
+  const image = images.find((i) => i?.is_main_image) ?? images[0];
+  const path = Array.isArray(p.category?.path) ? p.category.path.map((x) => str(x?.title)).filter(Boolean) : [];
+  const category = path.length ? path.join(" › ") : str(p.category?.title);
+  const attrs = p.structured_attributes && typeof p.structured_attributes === "object" ? p.structured_attributes : {};
   return {
-    id: p.id,
+    id,
     provider: "channel3",
-    title: p.title,
-    brands: (p.brands ?? []).map((b) => b.name ?? "").filter(Boolean),
-    description: p.description ?? null,
-    keyFeatures: (p.key_features ?? []).slice(0, 12),
-    attributes: Object.fromEntries(Object.entries(p.structured_attributes ?? {}).filter(([, v]) => Array.isArray(v) && v.length)),
-    materials: p.materials ?? [],
+    title,
+    brands: (Array.isArray(p.brands) ? p.brands : []).map((b) => str(b?.name)).filter((x): x is string => x !== null),
+    description: str(p.description),
+    keyFeatures: strings(p.key_features).slice(0, 12),
+    attributes: Object.fromEntries(
+      Object.entries(attrs)
+        .map(([k, v]) => [k, strings(v)] as const)
+        .filter(([, v]) => v.length),
+    ),
+    materials: strings(p.materials),
     category,
     offer: {
-      domain: hostOf(offer),
+      domain: hostOf(offer)!,
       price: offer.price!.price!,
-      currency: offer.price!.currency!.toUpperCase(),
+      currency: str(offer.price!.currency)!.toUpperCase(),
       availability,
-      condition: offer.condition ?? null,
+      condition: offer.condition === "new" || offer.condition === "used" ? offer.condition : null,
     },
-    imageUrl: image?.url ?? null,
+    imageUrl: str(image?.url),
     retrievedAt: now.toISOString(),
     hiddenText: [],
     synthetic: null,
   };
 }
-

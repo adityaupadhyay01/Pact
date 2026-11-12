@@ -52,6 +52,7 @@ export function testIntent(text: string): RawIntent {
     searchQuery: laptop ? "laptop" : null,
     budget: b && currency ? { max: Number(b[2].replace(/,/g, "")), currency, userQuote: b[0] } : null,
     constraints,
+    clarificationQuestion: null,
   };
 }
 

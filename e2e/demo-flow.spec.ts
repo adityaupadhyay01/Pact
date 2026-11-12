@@ -38,6 +38,8 @@ test("real-product mode refuses to run without AI instead of guessing", async ({
   const config = await (await page.request.get("/api/config")).json();
   test.skip(config.ai && config.catalog, "Only meaningful when Gemini or Channel3 isn't configured");
   await page.goto("/");
+  // Wait for the server status to load (the page is hydrated and knows what is configured).
+  await expect(page.getByText(/catalog (Channel3|not configured)/)).toBeVisible();
   await page.getByRole("radio", { name: /Real products/ }).check();
   await expect(page.getByText(/Real products are unavailable/)).toBeVisible();
   await page.getByLabel("What do you want to buy?").fill("Dark chocolate, 70% cocoa, under $10");
@@ -53,7 +55,7 @@ test("a hijacked agent is caught, and PACT pays only for a product that passes e
 
   await expect(page.getByText("TEST ·")).toBeVisible();
   // Step 2 and 3: the agent's pick, and the evidence against it.
-  await expect(page.getByText("The agent picked")).toBeVisible();
+  await expect(page.getByText("The Shopping Agent picked")).toBeVisible();
   await expect(page.getByText("Contains hidden text aimed at AI agents")).toBeVisible();
   // Step 4: the verdict, in plain words, with a safer alternative.
   await expect(page.getByText("Blocked: don't buy this one.")).toBeVisible();
@@ -163,4 +165,40 @@ test("a product that needs your OK can only be bought after you confirm each iss
   await confirm.click();
   await page.getByRole("button", { name: "Pay with PayPal" }).click();
   await expect(page.getByText("Payment complete", { exact: true })).toBeVisible();
+});
+
+test("declined card and closing PayPal are reachable in the UI and charge nothing", async ({ page }) => {
+  await startAndCheck(page);
+  await page.locator("#decision-primary").click();
+  await page.getByRole("button", { name: /Confirm .* and continue/ }).click();
+  await expect(page.getByText(/SIMULATED PayPal/)).toBeVisible();
+
+  await page.getByRole("button", { name: "Simulate a declined card" }).click();
+  await expect(page.getByRole("status").filter({ hasText: /PayPal declined that payment method/ })).toBeVisible();
+
+  await page.getByRole("button", { name: "Simulate closing PayPal" }).click();
+  await expect(page.getByRole("status").filter({ hasText: /You closed PayPal before paying/ }).first()).toBeVisible();
+
+  await page.getByRole("button", { name: "Pay with PayPal" }).click();
+  await expect(page.getByText("Payment complete", { exact: true })).toBeVisible();
+});
+
+test("mobile: no sideways scrolling, and the main actions stay reachable", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await openTestStore(page);
+  const overflow = () => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(await overflow()).toBeLessThanOrEqual(0);
+  await page.getByLabel("What do you want to buy?").fill(REQUEST);
+  await page.getByRole("button", { name: "Check my purchase" }).click();
+  await page.getByRole("button", { name: "Looks right, run the check" }).click();
+  await expect(page.locator("#decision-primary")).toBeVisible({ timeout: 20_000 });
+  expect(await overflow()).toBeLessThanOrEqual(0);
+  await page.locator("#decision-primary").click();
+  await expect(page.getByRole("button", { name: /Confirm .* and continue/ })).toBeVisible();
+});
+
+test("security headers are set", async ({ page }) => {
+  const res = await page.goto("/");
+  expect(res?.headers()["referrer-policy"]).toBe("no-referrer");
+  expect(res?.headers()["x-frame-options"]).toBe("DENY");
 });

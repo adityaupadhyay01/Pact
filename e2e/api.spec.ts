@@ -151,3 +151,12 @@ test("a receipt forged by recomputing every hash is rejected; the real one verif
   expect(bad.body.valid).toBe(false);
   expect(bad.body.signatureValid).toBe(false);
 });
+
+test("the API refuses cross-site and non-JSON requests", async ({ request }) => {
+  const cross = await request.post("/api/session", { data: { text: "socks under $10", mode: "test" }, headers: { origin: "https://evil.example" } });
+  expect(cross.status()).toBe(403);
+  const form = await request.post("/api/session", { form: { text: "socks under $10" } });
+  expect(form.status()).toBe(415);
+  const bad = await request.get("/api/session/not-a-uuid");
+  expect(bad.status()).toBe(404);
+});

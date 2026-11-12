@@ -177,7 +177,7 @@ export function Evidence({ session, control }: { session: SessionView; control: 
             or reordering any step breaks every fingerprint after it. The PACT server also signs the latest fingerprint
             with a secret key (HMAC), so even someone who recomputes every fingerprint can&apos;t produce a receipt that
             checks out.
-            {session.receipt.key === "ephemeral" && " This server uses a temporary demo key: set EVIDENCE_SECRET to keep receipts verifiable across restarts."}
+            {session.receipt.key === "ephemeral" && " This development server uses a temporary signing key, so this receipt stops verifying after a restart (hosted servers require a fixed key)."}
           </p>
           <ol className="divide-y divide-line border-y border-line">
             {events.map((e) => (

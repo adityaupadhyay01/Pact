@@ -1,6 +1,6 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
-import { formatMoney } from "./canonical";
+import { formatMoney, hashObject, toCents } from "./canonical";
 import {
   approve,
   BudgetSchema,
@@ -15,21 +15,23 @@ import {
 } from "./contract";
 import { appendEvent, verifyChain, type EvidenceEvent } from "./evidence";
 import { AiError, geminiChoose, geminiConfigured, geminiExtract, geminiIntent, geminiModel } from "./ai";
-import { groundIntent, SUPPORTED_CURRENCIES, type RawIntent } from "./intent";
-import { catalogFacts, groundFacts, snapshot, type AgentClaim, type Facts } from "./facts";
-import { detectInjectionInText } from "./injection";
+import { requireSafeConfig } from "./env";
+import { groundIntent, precheckRequest, SUPPORTED_CURRENCIES, type RawIntent } from "./intent";
+import { snapshot, type AgentClaim, type RawExtraction } from "./facts";
+import { inspect } from "./inspector";
 import { CatalogError, type ProductRecord } from "./catalog/types";
 import { channel3Configured, productChannel3, searchChannel3 } from "./catalog/channel3";
-import { searchTestStore } from "./catalog/testStore";
+import { searchTestStore, testStoreRecord } from "./catalog/testStore";
 import { testChoose, testExtract, testIntent } from "./heuristics";
 import { applyAttack, ATTACK_INFO, type SellerAttack } from "./seller-mode";
-import { createSnapshot, verifyOrder } from "./order-verify";
+import { createSnapshot, verifySnapshot, verifyOrder, type PurchaseSnapshot } from "./order-verify";
 import { captureOrder, createOrder, getOrder, PayPalError, paypalMode, simulateBuyerApproval } from "./paypal";
 import { receiptKeyMode, sign as signReceipt, verify as verifyReceipt } from "./receipt";
 import type { CheckoutQuote } from "./quote";
-import { evaluate } from "./rules";
-import { hit, LIMITS } from "./ratelimit";
+import { clientKey, hit, LIMITS } from "./ratelimit";
+import { PactError } from "./errors";
 import {
+  cleanupExpired,
   loadSession,
   OutdatedSessionError,
   saveSession,
@@ -42,19 +44,13 @@ import {
   type Verified,
 } from "./store";
 
-export class PactError extends Error {
-  constructor(
-    public status: number,
-    message: string,
-    public code?: string,
-  ) {
-    super(message);
-  }
-}
+export { PactError };
 
 const BUYER = "demo-buyer";
 /** How many other products PACT verifies besides the agent's pick, in live mode. */
 const LIVE_ALTERNATIVES = 2;
+/** A search for the same requirements within this window is reused (saves Channel3 credits). */
+const DISCOVERY_REUSE_MS = 10 * 60_000;
 
 const CHANGE_NAMES: Record<string, string> = { product: "the product", budget: "the budget", requirements: "a must-have" };
 
@@ -111,6 +107,22 @@ function catalogFailure(err: unknown): PactError {
 
 const isTest = (s: Session) => s.mode === "test" || s.sellerAttack !== null;
 
+/**
+ * Live AI steps need Gemini, and each check gets a bounded number of them,
+ * so one visitor can't exhaust the shared free quota.
+ */
+async function requireAiStep(s: Session) {
+  if (s.mode !== "live") return;
+  if (!geminiConfigured()) throw aiFailure(new AiError("unconfigured", "Gemini isn't configured on this server."));
+  const perVisitor = s.clientKey ? await hit(`ai:client:${s.clientKey}`, LIMITS.aiStepsPerClientHour.limit, LIMITS.aiStepsPerClientHour.window) : true;
+  if (!perVisitor || !(await hit(`ai:session:${s.id}`, LIMITS.aiStepsPerSession.limit, LIMITS.aiStepsPerSession.window))) {
+    throw new PactError(429, "This check has used its AI allowance. Start over to check again.", "RATE_LIMITED");
+  }
+  if (!(await hit("ai:global", LIMITS.aiPerMinute.limit, LIMITS.aiPerMinute.window))) {
+    throw new PactError(429, "PACT is busy right now (AI rate limit). Please try again in a minute.", "RATE_LIMITED");
+  }
+}
+
 // ------------------------------------------------------------------ 1. request → requirements
 
 export async function startSession(
@@ -118,10 +130,16 @@ export async function startSession(
   opts: { mode: Mode; sellerAttack: SellerAttack | null; client: string },
 ) {
   const requestText = text.trim().replace(/\s+/g, " ").slice(0, 600);
-  if (requestText.length < 5) throw new PactError(400, "Describe what you want to buy.");
+  if (requestText.length < 5) throw new PactError(400, "Describe what you want to buy.", "NOT_UNDERSTOOD");
+  // Gibberish never reaches the AI (or the rate-limit budget).
+  requireSafeConfig();
+  await cleanupExpired();
+  const pre = precheckRequest(requestText);
+  if (!pre.ok) throw new PactError(422, pre.message, "NOT_UNDERSTOOD");
   // Live checks spend Gemini and Channel3 quota; test-store checks don't, so they get their own looser bucket.
   const limit = opts.mode === "live" ? LIMITS.perClient : LIMITS.perClientTest;
-  if (!(await hit(`start:${opts.mode}:${opts.client}`, limit.limit, limit.window))) {
+  const visitor = clientKey(opts.client);
+  if (!(await hit(`start:${opts.mode}:${visitor}`, limit.limit, limit.window))) {
     throw new PactError(429, "Too many checks from this browser. Please wait a few minutes.", "RATE_LIMITED");
   }
 
@@ -148,7 +166,8 @@ export async function startSession(
   const outcome = groundIntent(raw, requestText);
   if (!outcome.ok) {
     const testHint = opts.mode === "test" ? " The test store only understands laptop requests." : "";
-    throw new PactError(422, outcome.message + testHint, outcome.reason === "not_shopping" ? "NOT_SHOPPING" : "NOT_UNDERSTOOD");
+    const code = { not_shopping: "NOT_SHOPPING", not_understood: "NOT_UNDERSTOOD", needs_clarification: "NEEDS_CLARIFICATION" }[outcome.reason];
+    throw new PactError(422, outcome.message + testHint, code);
   }
 
   const contract = createContract(outcome.requirements, requestText);
@@ -160,6 +179,7 @@ export async function startSession(
     expiresAt: new Date(now.getTime() + SESSION_TTL_DAYS * 86_400_000).toISOString(),
     mode: opts.mode,
     sellerAttack: opts.sellerAttack,
+    clientKey: visitor,
     requestText,
     intent: { engine, dropped: outcome.dropped, notes: outcome.notes },
     contracts: [contract],
@@ -323,6 +343,14 @@ export async function discover(id: string) {
     if (!channel3Configured()) {
       throw new PactError(503, "Product search unavailable: Channel3 isn't configured on this server.", "CATALOG_UNAVAILABLE");
     }
+    // Credit protection: a repeated click reuses this search instead of spending another credit.
+    if (s.discovery?.contractHash === contract.hash && Date.now() - Date.parse(s.discovery.retrievedAt) < DISCOVERY_REUSE_MS) {
+      return view(s);
+    }
+    const perVisitor = s.clientKey ? await hit(`catalog:client:${s.clientKey}`, LIMITS.searchesPerClientHour.limit, LIMITS.searchesPerClientHour.window) : true;
+    if (!perVisitor || !(await hit(`catalog:session:${s.id}`, LIMITS.searchesPerSession.limit, LIMITS.searchesPerSession.window))) {
+      throw new PactError(429, "This check has searched too many times. Start over to search again.", "RATE_LIMITED");
+    }
     if (!(await hit("catalog:monthly", LIMITS.catalogMonthly.limit, LIMITS.catalogMonthly.window))) {
       throw new PactError(503, "Product search unavailable: this demo has used its monthly search allowance.", "CATALOG_UNAVAILABLE");
     }
@@ -407,7 +435,7 @@ export async function select(id: string) {
     choice = testChoose(req, d.candidates);
     engine = "test";
   } else {
-    if (!geminiConfigured()) throw aiFailure(new AiError("unconfigured", "Gemini isn't configured on this server."));
+    await requireAiStep(s);
     try {
       choice = await geminiChoose(req, d.candidates);
     } catch (err) {
@@ -446,13 +474,10 @@ export async function select(id: string) {
 
 // ------------------------------------------------------------------ 4. PACT verification
 
-const visibleOf = (p: ProductRecord) =>
-  [p.title, p.description ?? "", ...p.keyFeatures, ...Object.entries(p.attributes).map(([k, v]) => `${k}: ${v.join(", ")}`)].join("\n");
-
 /**
- * Verify one product independently: build and hash the evidence, read facts
- * (catalog fields first, then a separate reader that never sees the agent's
- * output), ground every quote, and let the rule engine decide.
+ * Runs the Inspector on one product. Only the extraction step differs by mode:
+ * the test store uses a deterministic reader, live mode uses Gemini (and fails
+ * with AiError rather than guessing when Gemini is unavailable).
  */
 async function verifyOne(
   s: Session,
@@ -461,41 +486,45 @@ async function verifyOne(
   searchedPrice: number,
   agent: { claims: AgentClaim[]; summary: string } | null,
 ): Promise<Verified> {
-  const evidence = snapshot(record);
-  const fromCatalog = catalogFacts(req.constraints, record);
-  const toRead = req.constraints.filter((c) => !fromCatalog[c.id]);
-  let facts: Facts = {};
-  let rejected: Verified["rejected"] = [];
-  let instruction: string | null = null;
+  let extraction: RawExtraction | null = null;
   let reader: Verified["reader"] = "catalog_fields";
-
-  if (s.mode === "test") {
-    const g = groundFacts(testExtract(toRead, record), toRead, evidence.text);
-    facts = g.facts;
-    rejected = g.rejected;
-    reader = "test";
-  } else {
-    const raw = await geminiExtract(toRead, evidence.text); // throws AiError → refuse
-    const g = groundFacts(raw, toRead, evidence.text);
-    facts = g.facts;
-    rejected = g.rejected;
-    instruction = g.instruction;
-    reader = "gemini";
+  // Every requirement is read from the text too, so a catalog field and the description can be cross-checked.
+  if (req.constraints.length) {
+    if (s.mode === "test") {
+      extraction = testExtract(req.constraints, record);
+      reader = "test";
+    } else {
+      extraction = await geminiExtract(req.constraints, snapshot(record).text); // throws AiError → refuse
+      reader = "gemini";
+    }
   }
-  facts = { ...facts, ...fromCatalog };
-  for (const c of req.constraints) if (!(c.id in facts)) facts[c.id] = null;
+  const r = inspect({ requirements: req, record, extraction, searchedPrice, agent });
+  return { productId: record.id, record, ...r, reader, searchedPrice };
+}
 
-  const injection = detectInjectionInText(visibleOf(record), record.hiddenText, instruction);
-  const evaluation = evaluate({
-    requirements: req,
-    product: record,
-    facts,
-    injection,
-    searchedPrice,
-    agentClaims: agent?.claims,
-    agentSummary: agent?.summary,
-  });
-  return { productId: record.id, record, evidence, facts, rejected, injection, evaluation, reader, searchedPrice };
+/**
+ * Fetch one product again from its source, right now. Never falls back to an
+ * older copy: on failure it throws, and the caller gives no verdict or approval.
+ * The returned record must be the same product (same id).
+ */
+async function freshRecord(s: Session, old: ProductRecord): Promise<ProductRecord> {
+  let fresh: ProductRecord | null;
+  if (old.provider === "channel3") {
+    try {
+      fresh = await productChannel3(old.id, old.offer.currency);
+    } catch (err) {
+      const why = err instanceof CatalogError ? err.message : "Channel3 didn't respond.";
+      throw new PactError(503, `PACT couldn't re-fetch this product (${why}).`, "CATALOG_UNAVAILABLE");
+    }
+  } else {
+    fresh = testStoreRecord(old.id);
+  }
+  if (!fresh) throw new PactError(409, "This product is no longer available from the catalog. Choose another one.", "PRODUCT_GONE");
+  if (fresh.id !== old.id) {
+    throw new PactError(409, "The catalog returned a different product than the one checked. Choose the product again.", "PRODUCT_CHANGED");
+  }
+  void s;
+  return fresh;
 }
 
 export async function verify(id: string) {
@@ -506,18 +535,35 @@ export async function verify(id: string) {
   const d = s.discovery;
   const a = s.agent;
   if (!d || !a || a.contractHash !== contract.hash) throw new PactError(409, "Let the agent choose a product first.");
-  if (s.mode === "live" && !geminiConfigured()) throw aiFailure(new AiError("unconfigured", "Gemini isn't configured on this server."));
+  await requireAiStep(s);
 
-  let subjectRecord = d.candidates.find((c) => c.id === a.chosenId)!;
-  // Refresh price and availability before verifying (Channel3 caching guide; product detail is free).
-  if (s.mode === "live") {
-    try {
-      const fresh = await productChannel3(subjectRecord.id, subjectRecord.offer.currency);
-      if (fresh) subjectRecord = { ...subjectRecord, offer: fresh.offer, retrievedAt: fresh.retrievedAt };
-    } catch (err) {
-      console.warn("[verify] product refresh failed, using search data:", (err as Error).message);
-    }
+  // Live: every product PACT verifies is re-fetched from Channel3 first. If that fails, PACT gives no verdict
+  // at all (fail closed) instead of judging the seconds-old search copy as if it were fresh evidence.
+  const chosen = d.candidates.find((c) => c.id === a.chosenId)!;
+  let subjectRecord: ProductRecord;
+  try {
+    subjectRecord = await freshRecord(s, chosen);
+  } catch (err) {
+    s.verification = null;
+    s.snapshot = null;
+    s.order = null;
+    const reason = err instanceof PactError ? err.message : "the catalog didn't respond";
+    setService(s, "catalog", "error", "Channel3: product refresh failed, no verdict given");
+    log(s, {
+      type: "VERIFICATION_UNAVAILABLE",
+      actor: "pact",
+      summary: `PACT couldn't re-fetch ${chosen.title} from the catalog, so it gave no verdict. Nothing can be approved until a fresh check succeeds.`,
+      data: { productId: chosen.id, reason: err instanceof PactError ? err.code : "error" },
+      sources: [{ kind: "listing", ref: `${chosen.provider}:${chosen.id}` }],
+    });
+    await saveSession(s);
+    throw new PactError(
+      503,
+      `Verification unavailable: ${reason} PACT won't judge old search data as fresh evidence. Try again.`,
+      "VERIFICATION_UNAVAILABLE",
+    );
   }
+  if (s.mode === "live") setService(s, "catalog", "live", "Channel3: product details re-fetched for verification");
   if (s.sellerAttack) {
     subjectRecord = applyAttack(subjectRecord, s.sellerAttack, req);
     log(s, {
@@ -531,12 +577,12 @@ export async function verify(id: string) {
 
   let subject: Verified;
   try {
-    subject = await verifyOne(s, req, subjectRecord, d.searchedPrices[subjectRecord.id] ?? subjectRecord.offer.price, a);
+    subject = await verifyOne(s, req, subjectRecord, d.searchedPrices[subjectRecord.id] ?? chosen.offer.price, a);
   } catch (err) {
     throw aiFailure(err);
   }
 
-  // Alternatives: in the test store PACT checks everything; live, the cheapest few within budget.
+  // Alternatives: in the test store PACT checks everything; live, the cheapest few within budget, each re-fetched.
   const others = d.candidates
     .filter((c) => c.id !== subject.productId)
     .sort((x, y) => x.offer.price - y.offer.price);
@@ -544,8 +590,15 @@ export async function verify(id: string) {
   const alternatives: Verified[] = [];
   const unchecked: string[] = [];
   for (const rec of pool) {
+    let fresh: ProductRecord;
     try {
-      alternatives.push(await verifyOne(s, req, rec, d.searchedPrices[rec.id] ?? rec.offer.price, null));
+      fresh = await freshRecord(s, rec);
+    } catch {
+      unchecked.push(rec.id); // no fresh evidence, so not verified (and never offered for payment)
+      continue;
+    }
+    try {
+      alternatives.push(await verifyOne(s, req, fresh, d.searchedPrices[rec.id] ?? rec.offer.price, null));
     } catch (err) {
       if (err instanceof AiError) unchecked.push(rec.id);
       else throw err;
@@ -593,7 +646,39 @@ function findVerified(s: Session, productId: string): Verified | null {
 
 // ------------------------------------------------------------------ 5. purchase approval
 
-export async function approvePurchase(id: string, productId: string, acknowledgedFlags: string[]) {
+/** How long an approved purchase stays valid before PACT asks the buyer to re-check the product. */
+export const APPROVAL_TTL_MS = 20 * 60_000;
+
+/** The product's content without the retrieval time, to tell a real change from a re-fetch. */
+const contentHash = (v: Verified) => hashObject({ text: v.evidence.text, synthetic: v.record.synthetic });
+
+/** Re-fetch for approval: fresh from the source, with Seller Mode re-applied to its own (synthetic) target. */
+async function refreshRecord(s: Session, v: Verified, req: Requirements): Promise<ProductRecord> {
+  let fresh: ProductRecord;
+  try {
+    fresh = await freshRecord(s, v.record);
+  } catch (err) {
+    if (err instanceof PactError && err.code === "CATALOG_UNAVAILABLE") {
+      throw new PactError(503, `${err.message} Nothing was approved or charged. Try again.`, "CATALOG_UNAVAILABLE");
+    }
+    throw err;
+  }
+  if (v.record.synthetic?.kind === "seller-mode" && s.sellerAttack) fresh = applyAttack(fresh, s.sellerAttack, req);
+  return fresh;
+}
+
+/**
+ * The buyer approves one exact purchase. PACT re-fetches the product, re-reads
+ * it and re-runs every rule first, so an approval is never based on stale
+ * evidence. If anything material changed since the buyer last saw it, PACT
+ * stores the new result and asks them to look again.
+ */
+export async function approvePurchase(
+  id: string,
+  productId: string,
+  acknowledgedFlags: string[],
+  expected: { price?: number; currency?: string } = {},
+) {
   const s = await getSession(id);
   const contract = requireApprovedContract(s);
   // One paid purchase per session: a second "Buy" must be a deliberate new session, never an accidental double payment.
@@ -603,37 +688,59 @@ export async function approvePurchase(id: string, productId: string, acknowledge
   if (!s.verification || s.verification.contractHash !== contract.hash) {
     throw new PactError(409, "Run the check again for your current requirements.");
   }
-  const verified = findVerified(s, productId);
-  if (!verified) throw new PactError(404, "PACT hasn't checked that product.");
-
-  // Refresh price and availability right before approval; a change is caught here, not after payment.
-  let record = verified.record;
-  if (record.provider === "channel3") {
-    try {
-      const fresh = await productChannel3(record.id, record.offer.currency);
-      if (fresh && (fresh.offer.price !== record.offer.price || fresh.offer.availability !== record.offer.availability || fresh.offer.currency !== record.offer.currency)) {
-        record = { ...record, offer: fresh.offer, retrievedAt: fresh.retrievedAt };
-      }
-    } catch (err) {
-      throw new PactError(503, `Couldn't confirm the current price with Channel3 (${(err as Error).message}). Nothing was charged. Try again.`, "CATALOG_UNAVAILABLE");
-    }
-  }
+  const before = findVerified(s, productId);
+  if (!before) throw new PactError(404, "PACT hasn't checked that product.");
   const isSubject = s.verification.subject.productId === productId;
-  const ev = evaluate({
-    requirements: contract.requirements,
-    product: record,
-    facts: verified.facts,
-    injection: verified.injection,
-    searchedPrice: verified.record.offer.price,
-    agentClaims: isSubject ? s.agent?.claims : undefined,
-    agentSummary: isSubject ? s.agent?.summary : undefined,
-  });
-  if (record !== verified.record) {
-    // Keep the verified record in sync with what the buyer is approving.
-    verified.record = record;
-    verified.evidence = snapshot(record);
-    verified.evaluation = ev;
+  const req = contract.requirements;
+
+  await requireAiStep(s);
+  const record = await refreshRecord(s, before, req);
+  let after: Verified;
+  try {
+    after = await verifyOne(s, req, record, before.searchedPrice, isSubject && s.agent ? s.agent : null);
+  } catch (err) {
+    throw aiFailure(err);
   }
+
+  // Replace the stored result with the fresh one, whatever happens next.
+  if (isSubject) s.verification.subject = after;
+  else s.verification.alternatives = s.verification.alternatives.map((x) => (x.productId === productId ? after : x));
+  s.snapshot = null;
+  s.order = null;
+
+  const changes: string[] = [];
+  const bo = before.record.offer;
+  const ao = after.record.offer;
+  if (toCents(bo.price) !== toCents(ao.price) || bo.currency !== ao.currency) {
+    changes.push(`price ${formatMoney(bo.price, bo.currency)} → ${formatMoney(ao.price, ao.currency)}`);
+  }
+  if (bo.availability !== ao.availability) changes.push(`availability ${bo.availability} → ${ao.availability}`);
+  if (bo.domain !== ao.domain) changes.push(`seller ${bo.domain} → ${ao.domain}`);
+  if (before.evaluation.verdict !== after.evaluation.verdict) changes.push(`verdict ${before.evaluation.verdict} → ${after.evaluation.verdict}`);
+  if (!changes.length && contentHash(before) !== contentHash(after)) changes.push("listing details");
+  // The buyer must approve the price they were shown, not whatever the catalog says now.
+  if (expected.price !== undefined && toCents(expected.price) !== toCents(ao.price)) changes.push("the price you confirmed");
+  if (expected.currency !== undefined && expected.currency !== ao.currency) changes.push("currency");
+
+  log(s, {
+    type: "PRODUCT_REFRESHED",
+    actor: "pact",
+    summary: changes.length
+      ? `PACT re-checked ${after.record.title} before approval: it changed (${changes.join(", ")}).`
+      : `PACT re-checked ${after.record.title} before approval: nothing changed.`,
+    data: { productId, evidenceHash: after.evidence.hash, retrievedAt: after.evidence.retrievedAt, verdict: after.evaluation.verdict, changes },
+    sources: [{ kind: "listing", ref: `${after.record.provider}:${productId}` }],
+  });
+
+  if (changes.length) {
+    await saveSession(s);
+    throw new PactError(
+      409,
+      `This product changed since PACT checked it (${changes.join(", ")}). PACT updated the result: review it and confirm again.`,
+      "EVIDENCE_CHANGED",
+    );
+  }
+  const ev = after.evaluation;
   if (ev.verdict === "BLOCK") {
     await saveSession(s);
     throw new PactError(422, "PACT blocked this purchase: it breaks your requirements.", "BLOCKED");
@@ -645,29 +752,23 @@ export async function approvePurchase(id: string, productId: string, acknowledge
     throw new PactError(422, "Review and confirm each issue that needs your OK first.", "NEEDS_ACK");
   }
 
-  const quote: CheckoutQuote = {
-    currency: record.offer.currency,
-    itemPrice: record.offer.price,
-    shipping: 0,
-    tax: 0,
-    fees: [],
-    recurring: null,
-  };
+  const quote: CheckoutQuote = { currency: ao.currency, itemPrice: ao.price, shipping: 0, tax: 0, fees: [], recurring: null };
   s.snapshot = createSnapshot(contract, record.id, quote, flags, new Date(), {
-    evidenceHash: verified.evidence.hash,
-    seller: record.offer.domain,
+    evidenceHash: after.evidence.hash,
+    seller: ao.domain,
+    retrievedAt: after.evidence.retrievedAt,
   });
-  s.order = null;
   log(s, {
     type: "PURCHASE_APPROVED",
     actor: "buyer",
-    summary: `You confirmed ${record.title} for ${formatMoney(record.offer.price, record.offer.currency)} (item price; shipping and tax not included).`,
+    summary: `You confirmed ${record.title} for ${formatMoney(ao.price, ao.currency)} (item price; shipping and tax not included).`,
     data: {
       snapshotHash: s.snapshot.hash,
       contractHash: contract.hash,
       productId: record.id,
-      evidenceHash: verified.evidence.hash,
-      seller: record.offer.domain,
+      evidenceHash: after.evidence.hash,
+      retrievedAt: after.evidence.retrievedAt,
+      seller: ao.domain,
       quote,
       verdict: ev.verdict,
       acknowledgedFlags: flags,
@@ -676,6 +777,25 @@ export async function approvePurchase(id: string, productId: string, acknowledge
   });
   await saveSession(s);
   return view(s);
+}
+
+/**
+ * Re-validates an approved purchase right before money moves: the approval is
+ * intact, recent, and still matches the evidence PACT verified.
+ */
+function requireValidApproval(s: Session, contract: ContractVersion): { snapshot: PurchaseSnapshot; verified: Verified } {
+  const snap = s.snapshot;
+  if (!snap) throw new PactError(409, "Confirm the purchase first.");
+  if (!verifySnapshot(snap)) throw new PactError(409, "The purchase approval was altered. Confirm the purchase again.", "APPROVAL_INVALID");
+  if (snap.contractHash !== contract.hash) throw new PactError(409, "Your requirements changed after you approved. Confirm the purchase again.", "APPROVAL_INVALID");
+  const verified = findVerified(s, snap.listingId);
+  if (!verified || verified.evidence.hash !== snap.evidenceHash) {
+    throw new PactError(409, "The product evidence changed after you approved. Confirm the purchase again.", "APPROVAL_INVALID");
+  }
+  if (Date.now() - new Date(snap.approvedAt).getTime() > APPROVAL_TTL_MS) {
+    throw new PactError(409, "Your approval expired. PACT needs to re-check the product: confirm the purchase again.", "APPROVAL_EXPIRED");
+  }
+  return { snapshot: snap, verified };
 }
 
 /**
@@ -701,19 +821,15 @@ const sim = (s: Session) => (s.simOrders ??= {});
 export async function createPaypalOrder(id: string) {
   return withLock(id, async () => {
     const s = await getSession(id);
-    requireApprovedContract(s);
-    if (!s.snapshot) throw new PactError(409, "Confirm the purchase first.");
-    if (s.order?.status === "COMPLETED" && s.order.paypal?.customId === s.snapshot.hash) {
-      throw new PactError(409, "This purchase has already been paid.");
-    }
-    const verified = findVerified(s, s.snapshot.listingId);
-    if (!verified) throw new PactError(409, "Run the check again before paying.");
+    const contract = requireApprovedContract(s);
+    if (s.order?.status === "COMPLETED") throw new PactError(409, "This purchase has already been paid.");
+    const { snapshot: snap, verified } = requireValidApproval(s, contract);
     // The (simulated) merchant creates the order. Seller Mode may make it ask for more than approved.
-    const approved = s.snapshot.quote;
+    const approved = snap.quote;
     const sent = verified.record.orderPriceOverride ? { ...approved, itemPrice: verified.record.orderPriceOverride } : approved;
     let order;
     try {
-      order = await createOrder(sent, verified.productId, s.snapshot.hash, verified.record.title, sim(s));
+      order = await createOrder(sent, verified.productId, snap.hash, verified.record.title, sim(s));
     } catch (err) {
       throw paypalFailure(err, "PayPal couldn't start the payment. Nothing was charged. Please try again.");
     }
@@ -722,11 +838,11 @@ export async function createPaypalOrder(id: string) {
       return { orderId: order.id, session: view(s) };
     }
     s.order = { id: order.id, status: order.status, captureId: null, verification: null, paypal: null };
-    setService(s, "payments", paypalMode() === "sandbox" ? "live" : "simulated", paypalMode() === "sandbox" ? "PayPal Sandbox" : "PayPal simulator (no sandbox keys)");
+    setService(s, "payments", paypalMode() === "sandbox" ? "live" : "simulated", paypalMode() === "sandbox" ? "PayPal Sandbox" : "PayPal SIMULATED (no sandbox keys)");
     log(s, {
       type: "PAYPAL_ORDER_CREATED",
       actor: "paypal",
-      summary: `The seller created PayPal order ${order.id}${paypalMode() === "simulated" ? " (demo)" : ""}.`,
+      summary: `The seller created PayPal order ${order.id}${paypalMode() === "simulated" ? " (SIMULATED)" : ""}.`,
       data: { orderId: order.id, mode: paypalMode() },
       sources: [{ kind: "paypal", ref: `order:${order.id}` }],
     });
@@ -775,22 +891,30 @@ function paypalFailure(err: unknown, fallback: string): PactError {
     if (err.issue === "ORDER_NOT_APPROVED" || err.issue === "PAYER_ACTION_REQUIRED") {
       return new PactError(409, "Please approve the payment in the PayPal window first.");
     }
-    if (err.issue === "AUTH_FAILED") return new PactError(502, "PACT couldn't connect to PayPal. Nothing was charged.");
+    if (err.issue === "AUTH_FAILED") return new PactError(502, "PACT couldn't connect to PayPal. Nothing was charged.", "PAYMENTS_UNAVAILABLE");
+    if (err.issue === "UNAVAILABLE" || err.issue === "NOT_SANDBOX") {
+      return new PactError(503, "Payments are unavailable: PayPal Sandbox isn't configured on this server. Nothing was charged.", "PAYMENTS_UNAVAILABLE");
+    }
+    if (err.issue === "TIMEOUT" || err.issue === "NETWORK") {
+      return new PactError(502, `${err.message} Nothing was charged. Please try again.`, "PAYMENTS_UNAVAILABLE");
+    }
     if (err.issue === "RESOURCE_NOT_FOUND") return new PactError(404, "PayPal couldn't find this order. Nothing was charged.");
   }
-  console.error(err);
-  return new PactError(502, fallback);
+  // Log the kind of failure, not the payload (which can contain payer details).
+  console.error("[paypal]", err instanceof PayPalError ? `${err.status} ${err.issue}` : (err as Error)?.name);
+  return new PactError(502, fallback, "PAYMENTS_UNAVAILABLE");
 }
 
 export async function capture(id: string, orderId: string) {
   return withLock(id, async () => {
     const s = await getSession(id);
-    requireApprovedContract(s);
+    const contract = requireApprovedContract(s);
     if (!s.snapshot || !s.order || s.order.id !== orderId) throw new PactError(409, "No approved purchase for this order.");
-    if (s.snapshot.contractHash !== current(s).hash) throw new PactError(409, "The contract changed after approval.");
 
     // Already paid: return the original result instead of charging again.
     if (s.order.status === "COMPLETED" && s.order.captureId) return view(s);
+    // Re-validate the approval right before money moves (intact, recent, same evidence).
+    const { snapshot: snap } = requireValidApproval(s, contract);
 
     // Fetch the order from PayPal itself and compare with what the buyer approved.
     let order;
@@ -799,7 +923,7 @@ export async function capture(id: string, orderId: string) {
     } catch (err) {
       throw paypalFailure(err, "PACT couldn't read the order from PayPal. Nothing was charged. Please try again.");
     }
-    const verification = verifyOrder(s.snapshot, order);
+    const verification = verifyOrder(snap, order);
     s.order = { ...s.order, status: order.status, verification, paypal: order };
 
     if (!verification.ok) {
@@ -819,7 +943,7 @@ export async function capture(id: string, orderId: string) {
       type: "PAYPAL_ORDER_VERIFIED",
       actor: "pact",
       summary: `PACT checked PayPal order ${orderId}: it matches what you confirmed, to the cent.`,
-      data: { orderId, order, snapshotHash: s.snapshot.hash },
+      data: { orderId, order, snapshotHash: snap.hash },
       sources: [{ kind: "paypal", ref: `order:${orderId}` }],
     });
 
@@ -856,13 +980,39 @@ export async function capture(id: string, orderId: string) {
       throw failure;
     }
 
+    // PayPal must report a completed capture of exactly the approved amount.
+    if (cap.status !== "COMPLETED") {
+      s.order = { ...s.order, status: cap.status, captureId: cap.captureId };
+      log(s, {
+        type: "PAYPAL_CAPTURE_PENDING",
+        actor: "paypal",
+        summary: `PayPal hasn't completed the payment yet (status ${cap.status}). PACT doesn't count it as paid.`,
+        data: { orderId, captureId: cap.captureId, status: cap.status },
+        sources: [{ kind: "paypal", ref: `order:${orderId}` }],
+      });
+      await saveSession(s);
+      return view(s);
+    }
+    const capturedOk = cap.amount !== null && toCents(Number(cap.amount)) === toCents(snap.quote.itemPrice) && cap.currency === snap.quote.currency;
+    if (!capturedOk) {
+      s.order = { ...s.order, status: "CAPTURE_MISMATCH", captureId: cap.captureId };
+      log(s, {
+        type: "PAYPAL_CAPTURE_MISMATCH",
+        actor: "pact",
+        summary: `PayPal captured ${cap.amount ?? "an unknown amount"} ${cap.currency ?? ""}, not the ${formatMoney(snap.quote.itemPrice, snap.quote.currency)} you approved. PACT does not count this as a verified payment.`,
+        data: { orderId, captureId: cap.captureId, captured: { amount: cap.amount, currency: cap.currency }, approved: snap.quote },
+        sources: [{ kind: "paypal", ref: `capture:${cap.captureId}` }],
+      });
+      await saveSession(s);
+      return view(s);
+    }
     s.order = { ...s.order, status: cap.status, captureId: cap.captureId };
-    setService(s, "payments", paypalMode() === "sandbox" ? "live" : "simulated", paypalMode() === "sandbox" ? "PayPal Sandbox: payment captured" : "PayPal simulator: payment captured");
+    setService(s, "payments", paypalMode() === "sandbox" ? "live" : "simulated", paypalMode() === "sandbox" ? "PayPal Sandbox: payment captured" : "PayPal SIMULATED: payment captured");
     log(s, {
       type: "PAYPAL_CAPTURED",
       actor: "paypal",
-      summary: `Payment complete: ${formatMoney(Number(order.total), order.currency)}.`,
-      data: { orderId, captureId: cap.captureId, status: cap.status, amount: order.total, currency: order.currency },
+      summary: `Payment complete: PayPal captured ${formatMoney(Number(cap.amount), cap.currency ?? snap.quote.currency)}, exactly the price you approved.`,
+      data: { orderId, captureId: cap.captureId, status: cap.status, amount: cap.amount, currency: cap.currency, approved: snap.quote.itemPrice },
       sources: [{ kind: "paypal", ref: `capture:${cap.captureId}` }],
     });
     await saveSession(s);

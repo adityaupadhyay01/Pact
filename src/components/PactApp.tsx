@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MotionConfig } from "motion/react";
 import {
   AlertTriangle,
@@ -54,8 +54,8 @@ const TEST_EXAMPLES = [
 
 const STEPS: { id: StepId; label: string; title: string }[] = [
   { id: "requirements", label: "Requirements", title: "Your requirements" },
-  { id: "discovery", label: "Discovery", title: "Product discovery" },
-  { id: "verification", label: "Verification", title: "PACT verification" },
+  { id: "discovery", label: "Shopping Agent", title: "Product discovery" },
+  { id: "verification", label: "Inspector", title: "PACT Inspector" },
   { id: "decision", label: "Decision", title: "Your decision" },
   { id: "checkout", label: "Checkout", title: "Checkout" },
   { id: "evidence", label: "Receipt", title: "Evidence receipt" },
@@ -133,7 +133,13 @@ interface UiError {
 
 export function PactApp() {
   const [config, setConfig] = useState<AppConfig | null>(null);
-  const [mode, setMode] = useState<Mode>("live");
+  const [mode, setModeState] = useState<Mode>("live");
+  // Once the visitor picks a mode, a late config response must not override it.
+  const modePicked = useRef(false);
+  const setMode = useCallback((m: Mode) => {
+    modePicked.current = true;
+    setModeState(m);
+  }, []);
   const [attack, setAttack] = useState<SellerAttack | null>(null);
   const [text, setText] = useState("");
   const [session, setSessionState] = useState<SessionView | null>(null);
@@ -152,7 +158,7 @@ export function PactApp() {
       .then((c: AppConfig) => {
         setConfig(c);
         // Without Gemini and Channel3 there is no live mode; open on the clearly labelled test store instead.
-        if (!c.ai || !c.catalog) setMode("test");
+        if ((!c.ai || !c.catalog) && !modePicked.current) setModeState("test");
       })
       .catch(() => {});
   }, []);
@@ -469,7 +475,7 @@ export function PactApp() {
             Payments use PayPal Sandbox test money. No real money moves.
             {config && (
               <span className="mt-1 block">
-                PayPal {config.paypal === "sandbox" ? "Sandbox" : "simulator"} · AI {config.ai ? config.aiModel : "not configured"}{" "}
+                PayPal {config.paypal === "sandbox" ? "Sandbox (test money)" : config.paypal === "simulated" ? "SIMULATED" : "unavailable"} · AI {config.ai ? config.aiModel : "not configured"}{" "}
                 · catalog {config.catalog ? "Channel3" : "not configured"} · storage {config.storage}
               </span>
             )}
@@ -512,8 +518,12 @@ function ErrorBox({ error, onDismiss, onRetry }: { error: UiError; onDismiss: ()
   const title =
     error.code === "AI_UNAVAILABLE"
       ? "AI unavailable"
-      : error.code === "CATALOG_UNAVAILABLE"
+      : error.code === "VERIFICATION_UNAVAILABLE"
+        ? "Verification unavailable"
+        : error.code === "CATALOG_UNAVAILABLE"
         ? "Product catalog unavailable"
+        : error.code === "STORAGE_UNAVAILABLE" || error.code === "RATE_LIMIT_UNAVAILABLE" || error.code === "CONFIG_MISSING"
+          ? "Temporarily unavailable"
         : error.code === "RATE_LIMITED"
           ? "Slow down"
           : "Something went wrong";
@@ -527,6 +537,9 @@ function ErrorBox({ error, onDismiss, onRetry }: { error: UiError; onDismiss: ()
           <span className="font-semibold text-block">{title}: </span>
           {error.message}
         </p>
+        {error.code === "VERIFICATION_UNAVAILABLE" && (
+          <p className="mt-1 text-ink-2">No verdict was given, and nothing can be approved until PACT re-fetches the product successfully.</p>
+        )}
         {error.code === "AI_UNAVAILABLE" && (
           <p className="mt-1 text-ink-2">PACT won&apos;t guess or check a product without AI. Nothing was bought or charged.</p>
         )}
@@ -563,8 +576,8 @@ function TestBanner({ session }: { session: SessionView }) {
 
 const AFTER_CLICK = [
   { title: "Your requirements", text: "PACT turns your words into requirements and a budget. You confirm them." },
-  { title: "Product discovery", text: "PACT searches real products and an AI shopping agent picks one." },
-  { title: "PACT verification", text: "The pick is compared with your requirements, the seller's listing and the price." },
+  { title: "Shopping Agent", text: "PACT searches real products (Channel3) and an AI Shopping Agent (Gemini) picks one and explains why." },
+  { title: "PACT Inspector", text: "Separately, PACT checks the pick against your requirements using only the retrieved listing, never the agent's words." },
   { title: "Your decision", text: "You see Match, Check first or Blocked, and exactly why." },
   { title: "Checkout and receipt", text: "Only if you approve, you pay with PayPal Sandbox. PACT re-checks the amount first." },
 ];
@@ -655,6 +668,11 @@ function Home({
           </div>
         </fieldset>
 
+        {config && config.configOk === false && (
+          <p role="status" className="mb-4 border-l-2 border-block bg-block-soft px-3 py-2 text-sm text-ink">
+            This server isn&apos;t fully configured, so some steps will refuse to run: {(config.problems ?? []).join(" ")}
+          </p>
+        )}
         {liveBlocked && (
           <p role="status" className="mb-4 border-l-2 border-flag-icon bg-flag-soft px-3 py-2 text-sm text-ink">
             <AlertTriangle className="mr-1 inline h-4 w-4 text-flag" />
@@ -730,6 +748,8 @@ function Home({
                 ? "AI unavailable: "
                 : error.code === "NOT_SHOPPING" || error.code === "NOT_UNDERSTOOD"
                   ? "PACT couldn't use that: "
+                  : error.code === "NEEDS_CLARIFICATION"
+                    ? "Tell PACT a bit more: "
                   : "Something went wrong: "}
             </span>
             {error.message}
@@ -751,7 +771,7 @@ function Home({
         </div>
         <p id="privacy-note" className="mt-4 text-xs leading-relaxed text-muted">
           {mode === "live"
-            ? "Don't include personal details (name, address, card numbers). Your request is sent to Google Gemini on the free tier, where Google may use prompts to improve its products. Product data comes from Channel3; PACT shows the merchant's domain only, with no affiliate links. Requests are kept for 7 days."
+            ? "Don't include personal details (name, address, card numbers). Your request is sent to Google Gemini on the free tier, where Google may use prompts to improve its products. Product data comes from Channel3 (US merchants, prices in USD); PACT shows the merchant's domain only, with no affiliate links. Sessions, including your request, expire after 7 days and can't be reopened; expired sessions are then deleted by PACT's periodic cleanup."
             : "Test store mode sends nothing to an AI service. Products are fictional."}
         </p>
       </form>

@@ -44,7 +44,7 @@ export interface SearchRequest {
 
 export class CatalogError extends Error {
   constructor(
-    public kind: "unconfigured" | "auth" | "credits" | "rate_limited" | "timeout" | "not_found" | "bad_request" | "upstream",
+    public kind: "unconfigured" | "auth" | "credits" | "rate_limited" | "timeout" | "not_found" | "bad_request" | "malformed" | "outage" | "upstream",
     message: string,
   ) {
     super(message);

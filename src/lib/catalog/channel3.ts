@@ -33,7 +33,15 @@ async function call<T>(path: string, init: RequestInit): Promise<T> {
     const timeout = (err as Error).name === "TimeoutError" || (err as Error).name === "AbortError";
     throw new CatalogError(timeout ? "timeout" : "upstream", timeout ? "Channel3 took too long to respond." : "Couldn't reach Channel3.");
   }
-  if (res.ok) return (await res.json()) as T;
+  if (res.ok) {
+    try {
+      const json = (await res.json()) as unknown;
+      if (json && typeof json === "object") return json as T;
+    } catch {
+      // fall through
+    }
+    throw new CatalogError("malformed", "Channel3 sent a response PACT couldn't read.");
+  }
   const kind =
     res.status === 401 || res.status === 403
       ? "auth"
@@ -45,13 +53,16 @@ async function call<T>(path: string, init: RequestInit): Promise<T> {
             ? "not_found"
             : res.status === 400 || res.status === 422
               ? "bad_request"
-              : "upstream";
+              : res.status >= 500
+                ? "outage"
+                : "upstream";
   const messages: Record<string, string> = {
     auth: "Channel3 rejected the API key.",
     credits: "Channel3 credits are used up for this month.",
     rate_limited: "Channel3 is rate-limiting requests. Try again in a few seconds.",
     not_found: "Channel3 couldn't find that product anymore.",
     bad_request: "Channel3 couldn't run this search.",
+    outage: `Channel3 is having problems right now (${res.status}). Try again shortly.`,
     upstream: `Channel3 returned an error (${res.status}).`,
   };
   throw new CatalogError(kind as CatalogError["kind"], messages[kind]);
@@ -68,9 +79,10 @@ export async function searchChannel3(req: SearchRequest): Promise<ProductRecord[
     },
     config: { currency: req.currency, country: "US", mode: "default" },
   };
-  const res = await call<{ products?: C3Product[] }>("/v1/search", { method: "POST", body: JSON.stringify(body) });
+  const res = await call<{ products?: unknown }>("/v1/search", { method: "POST", body: JSON.stringify(body) });
+  if (res.products !== undefined && !Array.isArray(res.products)) throw new CatalogError("malformed", "Channel3 sent a search result PACT couldn't read.");
   const now = new Date();
-  return (res.products ?? []).map((p) => normalise(p, now)).filter((p): p is ProductRecord => p !== null);
+  return ((res.products as C3Product[] | undefined) ?? []).map((p) => normalise(p, now)).filter((p): p is ProductRecord => p !== null);
 }
 
 /** Fresh product data (free endpoint). Used before verification and approval. */

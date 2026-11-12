@@ -6,15 +6,21 @@ import { BadgeCheck, ShieldX } from "lucide-react";
 import { ChecksList } from "./Checks";
 import { findVerified } from "./flow";
 import { Button, Details, focusSoon, Step, type StepControl, money, shortHash } from "./ui";
-import { sessionAction, type SessionView } from "./api";
+import { ApiError, sessionAction, type SessionView } from "./api";
+
+/** Server answers that mean the product or the approval changed: reload the session before showing the reason. */
+const RELOAD_ON = new Set(["EVIDENCE_CHANGED", "APPROVAL_EXPIRED", "APPROVAL_INVALID", "BLOCKED", "PRODUCT_GONE"]);
 
 export interface AppConfig {
-  paypal: "sandbox" | "simulated";
+  paypal: "sandbox" | "simulated" | "unavailable";
   paypalClientId: string | null;
   ai: boolean;
   aiModel: string | null;
   catalog: boolean;
+  catalogRegion?: string;
   storage: string;
+  configOk?: boolean;
+  problems?: string[];
 }
 
 export function Checkout({
@@ -47,12 +53,21 @@ export function Checkout({
   const blocked = Boolean(order?.verification && !order.verification.ok && !captured);
   const declined = order?.status === "DECLINED";
   const cancelled = order?.status === "CANCELLED";
+  const pending = Boolean(order && !captured && !blocked && order.captureId && order.status !== "CAPTURE_MISMATCH");
+  const mismatch = order?.status === "CAPTURE_MISMATCH";
+  const simulated = config.paypal === "simulated";
 
   const run = async (fn: () => Promise<void>) => {
     setBusy(true);
     try {
       await fn();
     } catch (e) {
+      // When the product or the approval changed on the server, show the fresh state, then the reason.
+      if (e instanceof ApiError && e.code && RELOAD_ON.has(e.code)) {
+        const fresh = await fetch(`/api/session/${encodeURIComponent(session.id)}`).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+        if (fresh) setSession(fresh as SessionView);
+        if (e.code === "EVIDENCE_CHANGED") setAcks([]);
+      }
       onError((e as Error).message);
     } finally {
       setBusy(false);
@@ -61,16 +76,30 @@ export function Checkout({
 
   const approvePurchase = () =>
     run(async () => {
-      setSession(await sessionAction(session.id, "purchase", { productId: selectedId, acknowledgedFlags: acks }));
+      // The price shown is sent only so the server can refuse if it changed; the server's fresh price is what counts.
+      setSession(
+        await sessionAction(session.id, "purchase", {
+          productId: selectedId,
+          acknowledgedFlags: acks,
+          expectedPrice: q.itemPrice,
+          expectedCurrency: q.currency,
+        }),
+      );
       focusSoon("pay-button");
     });
 
-  const paySimulated = () =>
+  /** Simulator only: walks the same server path a PayPal popup would, with the outcome the buyer picks. */
+  const paySimulated = (outcome: "pay" | "decline" | "cancel") =>
     run(async () => {
       const { orderId } = await sessionAction<{ orderId: string }>(session.id, "order");
-      await sessionAction(session.id, "sim-approve", { orderId });
+      if (outcome === "cancel") {
+        setSession(await sessionAction(session.id, "cancel", { orderId }));
+        focusSoon("pay-button");
+        return;
+      }
+      await sessionAction(session.id, "sim-approve", { orderId, decline: outcome === "decline" });
       setSession(await sessionAction(session.id, "capture", { orderId }));
-      focusSoon("payment-result");
+      focusSoon(outcome === "pay" ? "payment-result" : "pay-button");
     });
 
   const total = snap ? snap.quote.itemPrice : q.itemPrice;
@@ -196,21 +225,52 @@ export function Checkout({
                   You closed PayPal before paying. Nothing was charged. You can try again whenever you&apos;re ready.
                 </p>
               )}
+              {pending && (
+                <p role="status" className="border-l-2 border-flag-icon bg-flag-soft px-3 py-2 text-sm text-ink">
+                  PayPal hasn&apos;t completed this payment yet (status {order?.status}). PACT doesn&apos;t count it as paid.
+                </p>
+              )}
+              {mismatch && (
+                <p role="alert" className="border-l-2 border-block bg-block-soft px-3 py-2 text-sm text-ink">
+                  PayPal reported a captured amount that differs from the price you approved. PACT does not treat this as a
+                  verified payment. See the receipt below.
+                </p>
+              )}
               {config.paypal === "sandbox" && config.paypalClientId ? (
-                <PayPalButtons
-                  clientId={config.paypalClientId}
-                  currency={q.currency}
-                  sessionId={session.id}
-                  setSession={setSession}
-                  onError={onError}
-                />
-              ) : (
                 <>
-                  <Button id="pay-button" variant="paypal" className="w-full py-3 text-base" onClick={paySimulated} loading={busy}>
+                  <PayPalButtons
+                    clientId={config.paypalClientId}
+                    currency={q.currency}
+                    sessionId={session.id}
+                    setSession={setSession}
+                    onError={onError}
+                  />
+                  <p className="text-xs text-muted">
+                    <span className="eyebrow mr-1 text-flag">Sandbox</span>
+                    PayPal test money. This isn&apos;t the merchant&apos;s checkout and no order is placed with the store.
+                  </p>
+                </>
+              ) : simulated ? (
+                <>
+                  <p className="eyebrow inline-block border border-flag-line bg-flag-soft px-1.5 py-0.5 text-flag">
+                    SIMULATED PayPal: no PayPal account or real payment involved
+                  </p>
+                  <Button id="pay-button" variant="paypal" className="w-full py-3 text-base" onClick={() => paySimulated("pay")} loading={busy}>
                     Pay with PayPal
                   </Button>
-                  <p className="text-xs text-muted">Demo mode: this simulates PayPal, no account needed.</p>
+                  <div className="flex flex-wrap gap-2" role="group" aria-label="Try other PayPal outcomes">
+                    <Button variant="secondary" onClick={() => paySimulated("decline")} disabled={busy}>
+                      Simulate a declined card
+                    </Button>
+                    <Button variant="secondary" onClick={() => paySimulated("cancel")} disabled={busy}>
+                      Simulate closing PayPal
+                    </Button>
+                  </div>
                 </>
+              ) : (
+                <p role="alert" className="border-l-2 border-block bg-block-soft px-3 py-2 text-sm text-ink">
+                  Payments are unavailable: PayPal Sandbox isn&apos;t configured on this server. Nothing can be charged.
+                </p>
               )}
             </div>
           )}

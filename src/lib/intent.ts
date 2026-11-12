@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { OperatorSchema, type Constraint, type Requirements } from "./contract";
+import { normalizeUnit } from "./units";
 
 /**
  * Raw intent as returned by the language model. Everything here is untrusted
@@ -30,15 +31,64 @@ export const RawIntentSchema = z.object({
       }),
     )
     .max(12),
+  /** Set when the request is too vague to search for (e.g. "something nice"): one short question to ask. */
+  clarificationQuestion: z.string().nullable(),
 });
 export type RawIntent = z.infer<typeof RawIntentSchema>;
 
-/** Currencies the catalog can price in (Channel3 `config.currency`). */
-export const SUPPORTED_CURRENCIES = ["USD", "CAD", "AUD", "GBP", "EUR", "SEK", "CZK", "RON", "CHF", "PLN"];
+/**
+ * This MVP searches US merchants and pays through PayPal Sandbox in US dollars,
+ * so budgets are USD only. Other currencies are refused, never converted.
+ */
+export const SUPPORTED_CURRENCIES = ["USD"];
+
+/** Currency words and symbols a buyer might write. "$" is read as USD (US-only MVP). */
+const CURRENCY_MARKERS: [string, RegExp][] = [
+  ["CAD", /\bcad\b|\bc\$|canadian dollars?/i],
+  ["AUD", /\baud\b|\ba\$|australian dollars?/i],
+  ["EUR", /€|\beur\b|\beuros?\b/i],
+  ["GBP", /£|\bgbp\b|\bpounds? sterling\b|\bquid\b/i],
+  ["INR", /₹|\binr\b|\brupees?\b/i],
+  ["USD", /\$|\busd\b|\bdollars?\b|\bbucks?\b/i],
+];
+
+/** The currency the buyer actually wrote in this quote, if any. */
+export function currencyIn(quote: string): string | null {
+  return CURRENCY_MARKERS.find(([, re]) => re.test(quote))?.[0] ?? null;
+}
+
+/** True when the unit (or a spelling of it) appears in the buyer's words, e.g. "GB" in "16gb", "%" in "70 percent". */
+export function unitAppearsIn(unit: string, quote: string): boolean {
+  const want = normalizeUnit(unit);
+  if (!want) return false;
+  if (want === "%" || want === "percent") return /%|\bpercent\b|\bpct\b/i.test(quote);
+  const tokens = quote
+    .toLowerCase()
+    .replace(/(\d)([a-z"])/g, "$1 $2")
+    .split(/[^a-z"]+/)
+    .filter(Boolean);
+  return tokens.some((t) => normalizeUnit(t) === want);
+}
+
+/**
+ * A cheap, deterministic check before any AI call: is there anything here a
+ * person could be asking to buy? Rejects empty, symbol-only and keyboard-mash input.
+ */
+export function precheckRequest(text: string): { ok: true } | { ok: false; message: string } {
+  const words = text.toLowerCase().match(/[a-z]{2,}/g) ?? [];
+  const real = words.filter((w) => /[aeiouy]/.test(w) && !/(.)\1{3,}/.test(w) && !/[bcdfghjklmnpqrstvwxz]{5,}/.test(w));
+  if (real.length === 0 || real.join("").length < 3) {
+    return {
+      ok: false,
+      message: "PACT couldn't find a product in that. Describe what you want to buy, for example “running shoes, size 9, under $120”.",
+    };
+  }
+  return { ok: true };
+}
 
 export type IntentOutcome =
   | { ok: true; requirements: Requirements; dropped: { what: string; reason: string }[]; notes: string[] }
-  | { ok: false; reason: "not_shopping" | "not_understood"; message: string };
+  | { ok: false; reason: "not_shopping" | "not_understood" | "needs_clarification"; message: string };
 
 const norm = (s: string) =>
   s
@@ -87,6 +137,10 @@ export function groundIntent(raw: RawIntent, text: string): IntentOutcome {
     };
   }
   const product = raw.product?.trim();
+  const question = raw.clarificationQuestion?.trim();
+  if (question && (!product || !appearsIn(raw.productQuote, text))) {
+    return { ok: false, reason: "needs_clarification", message: `Your request is too open to search for. ${question.slice(0, 200)}` };
+  }
   if (!product || !appearsIn(raw.productQuote, text)) {
     return {
       ok: false,
@@ -103,12 +157,16 @@ export function groundIntent(raw: RawIntent, text: string): IntentOutcome {
   if (raw.budget) {
     const b = raw.budget;
     const currency = b.currency.trim().toUpperCase();
+    // The currency comes from the buyer's words, not the model's guess.
+    const written = appearsIn(b.userQuote, text) ? currencyIn(b.userQuote) : null;
     if (!appearsIn(b.userQuote, text) || !numberAppearsIn(b.max, b.userQuote) || !(b.max > 0)) {
       dropped.push({ what: `budget ${b.max} ${currency}`, reason: "not found in your words" });
-    } else if (!SUPPORTED_CURRENCIES.includes(currency)) {
-      dropped.push({ what: `budget in ${currency}`, reason: `PACT can't search prices in ${currency} yet` });
+    } else if (!written) {
+      dropped.push({ what: `budget ${b.max}`, reason: "no currency in your words, so PACT asks instead of assuming" });
+    } else if (!SUPPORTED_CURRENCIES.includes(written)) {
+      dropped.push({ what: `budget in ${written}`, reason: "this version only supports US dollars (US merchants)" });
     } else {
-      budget = { max: b.max, currency, scope: "item_price", origin: "request", userQuote: b.userQuote.trim() };
+      budget = { max: b.max, currency: written, scope: "item_price", origin: "request", userQuote: b.userQuote.trim() };
     }
   }
 
@@ -133,6 +191,12 @@ export function groundIntent(raw: RawIntent, text: string): IntentOutcome {
       dropped.push({ what: label, reason: "the number isn't in your words" });
       continue;
     }
+    // A unit must be in the buyer's words too. "16 RAM" stays unit-less, and PACT then says it can't compare it.
+    let unit = c.unit?.trim() || null;
+    if (unit && !unitAppearsIn(unit, c.userQuote)) {
+      notes.push(`“${label}”: the unit ${unit} isn't in your words, so PACT didn't assume it.`);
+      unit = null;
+    }
     const attribute = slug(c.attribute);
     const key = `${attribute}:${c.operator}:${value}`;
     if (seen.has(key)) continue;
@@ -143,7 +207,7 @@ export function groundIntent(raw: RawIntent, text: string): IntentOutcome {
       attribute,
       operator: c.operator,
       value: c.operator === "present" ? null : value,
-      unit: c.unit?.trim() || null,
+      unit,
       mandatory: c.mandatory,
       origin: "request",
       userQuote: c.userQuote.trim().slice(0, 200),
